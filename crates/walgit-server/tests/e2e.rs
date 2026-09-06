@@ -3058,3 +3058,67 @@ async fn reads_after_an_acknowledged_push_never_show_the_previous_tip() -> TestR
     assert!(stale.is_empty(), "stale reads:\n{}", stale.join("\n"));
     Ok(())
 }
+
+/// #37: a ref-only push carries a 32-byte zero-object pack, and receive-pack used to skip the
+/// connectivity check for it, so `refs/heads/ghost` could be published pointing at an object
+/// nobody has, after which every clone walking it died with `missing object`. The tip is now
+/// checked like any other, and a ref-only push to an object the server does have still lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn empty_pack_push_to_a_missing_object_is_refused() -> TestResult {
+    for check_connectivity in [true, false] {
+        empty_pack_push_is_refused_with(check_connectivity).await?;
+    }
+    Ok(())
+}
+
+/// Both tip checks refuse it: the full walk, and the bare lookup a host with
+/// `wal.check_connectivity = false` falls back to.
+async fn empty_pack_push_is_refused_with(check_connectivity: bool) -> TestResult {
+    let server =
+        Server::start_with_tweak(|c| c.wal.check_connectivity = check_connectivity).await?;
+    server.put_repo("t", "ghost").await?;
+    let src = TestRepo::synthetic(2, 2)?;
+    git_in(&src, &["branch", "-M", "main"])?;
+    git_in(
+        &src,
+        &["remote", "add", "origin", &server.repo_url("t", "ghost")],
+    )?;
+    git_in(&src, &["push", "-q", "origin", "main"])?;
+
+    // One command line, a flush, then the empty pack: header, zero objects, its checksum.
+    let cmd = format!(
+        "{} {} refs/heads/ghost\0report-status\n",
+        "0".repeat(40),
+        "b".repeat(40)
+    );
+    let mut body = format!("{:04x}{cmd}0000", cmd.len() + 4).into_bytes();
+    body.extend_from_slice(b"PACK\x00\x00\x00\x02\x00\x00\x00\x00");
+    body.extend_from_slice(&[
+        0x02, 0x9d, 0x08, 0x82, 0x3b, 0xd8, 0xa8, 0xea, 0xb5, 0x10, 0xad, 0x6a, 0xc7, 0x5c, 0x82,
+        0x3c, 0xfd, 0x3e, 0xd3, 0x1e,
+    ]);
+    let resp = reqwest::Client::new()
+        .post(format!("{}/t/ghost.git/git-receive-pack", server.base_url))
+        .header("Content-Type", "application/x-git-receive-pack-request")
+        .body(body)
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 200);
+    let report = resp.text().await?;
+    assert!(
+        report.contains("ng refs/heads/ghost"),
+        "check_connectivity={check_connectivity}: {report}"
+    );
+    assert!(!report.contains("ok refs/heads/ghost"), "{report}");
+    let refs = git_in(&src, &["ls-remote", "origin"])?;
+    assert!(!refs.contains("refs/heads/ghost"), "{refs}");
+
+    // The legitimate shape of the same wire bytes: a new branch at an object the server has.
+    git_in(&src, &["push", "-q", "origin", "main:refs/heads/copy"])?;
+    let refs = git_in(&src, &["ls-remote", "origin"])?;
+    assert!(
+        refs.contains("refs/heads/copy"),
+        "check_connectivity={check_connectivity}: {refs}"
+    );
+    Ok(())
+}
