@@ -125,6 +125,9 @@ fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<u64> {
     Ok(bytes)
 }
 
+// statvfs's block fields are u32 on macOS and u64 on Linux, so `as u64` is the one spelling
+// that is lossless on both; `From` would be a useless conversion on Linux.
+#[allow(clippy::cast_lossless)]
 fn disk_avail(path: &Path) -> Option<u64> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
