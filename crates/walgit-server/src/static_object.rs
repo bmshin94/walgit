@@ -1,4 +1,4 @@
-//! HTTP serving of immutable store objects (bundles, LFS objects, packs) with
+//! HTTP serving of immutable store objects (LFS objects, packs) with
 //! the complete conditional/range contract a CDN or `git` expects:
 //!
 //! * strong `ETag` = the store version (GCS generation / S3 `ETag`), quoted;
@@ -241,7 +241,7 @@ pub async fn serve(
     // Edge offload: the nginx in front told us it honours X-Accel-Redirect. We
     // still do auth (the caller did), existence, strong validators and 304 here;
     // nginx fetches the object with its own credentials, slices Range itself and
-    // caches the bytes on its disk, so a 32 GB bundle never ties up a worker on
+    // caches the bytes on its disk, so a large static object never ties up a worker on
     // this instance. HEAD stays local (metadata only, nothing to offload).
     if opts.accel
         && !head

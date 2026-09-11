@@ -73,7 +73,7 @@ fi
 TMP="$(mktemp -d)"
 PIDS=()
 # "${PIDS[@]:-}": bash 3.2 (macOS /bin/bash) calls an empty array expansion an unbound variable
-# under set -u, which aborts the EXIT trap before rm -rf. Same guard as tests/git-bundle-filter.sh:24.
+# under set -u, which aborts the EXIT trap before rm -rf.
 cleanup() { for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done; wait 2>/dev/null || true; rm -rf "$TMP"; }
 trap cleanup EXIT
 
@@ -104,8 +104,6 @@ dir = "$TMP/cache"
 [wal]
 freshness_ttl = "0s"
 [compaction]
-enabled = false
-[bundles]
 enabled = false
 [lfs]
 enabled = false
@@ -274,8 +272,6 @@ dir = "$TMP/cache-s3"
 [wal]
 freshness_ttl = "0s"
 [compaction]
-enabled = false
-[bundles]
 enabled = false
 [lfs]
 enabled = false

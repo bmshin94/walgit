@@ -38,7 +38,7 @@ pub enum WalError {
     /// refs-level operations still work, object access must go elsewhere
     /// (bundle-uri, a disk-backed backend).
     #[error(
-        "repository pack set is {bytes} bytes, larger than this instance's cache limit ({max} bytes); clone via bundle-uri"
+        "repository pack set is {bytes} bytes, larger than this instance's cache limit ({max} bytes); retry on a host with enough capacity or use a bounded clone"
     )]
     TooLarge { bytes: u64, max: u64 },
 }

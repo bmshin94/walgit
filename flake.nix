@@ -98,7 +98,7 @@
             mkdir -p web
             cp -a ${web} web/dist
           '';
-          # `walgit serve` shells out to git (upload-pack, repack, bundle, index-pack).
+          # `walgit serve` shells out to git (upload-pack, repack, index-pack).
           nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ pkgs.makeWrapper ];
           postInstall = ''
             for b in walgit walgit-server; do
@@ -106,7 +106,7 @@
             done
           '';
           meta = {
-            description = "git hosting on an object store: smart HTTP, bundle-uri, LFS, web UI — one binary";
+            description = "git hosting on an object store: smart HTTP, LFS, web UI — one binary";
             mainProgram = "walgit";
             license = lib.licenses.mit;
           };

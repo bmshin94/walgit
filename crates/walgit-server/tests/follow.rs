@@ -65,7 +65,6 @@ async fn follows_upstream_refs_through_the_wal_fast_forward_only() -> anyhow::Re
             c.upstream.git = Some(up_url.clone());
             c.upstream.follow = vec!["refs/heads/main".into(), "refs/tags/v1".into()];
             c.compaction.enabled = false;
-            c.bundles.enabled = false;
             c.wal.snapshot_every_entries = 0;
         })
     )?;

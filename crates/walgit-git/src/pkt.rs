@@ -368,9 +368,6 @@ pub fn parse_object_info(cmd: &V2Command) -> ObjectInfoRequest {
     req
 }
 
-/// `bundle-uri` has no arguments in v2.
-pub fn parse_bundle_uri(_cmd: &V2Command) {}
-
 fn io_to_git(e: std::io::Error) -> GitError {
     GitError::Io(e)
 }
