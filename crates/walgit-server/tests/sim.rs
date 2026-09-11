@@ -488,11 +488,8 @@ async fn check_truth(c: &Cluster, pushers: &[Pusher]) -> Result<()> {
     let prefix = c.repo_prefix();
     let cp_seq = manifest.checkpoint.as_ref().map_or(0, |cp| cp.seq);
     let mut folded: HashMap<String, String> = HashMap::new();
-    if cp_seq > 0 {
-        let key = format!(
-            "{prefix}{}",
-            walgit_proto::keys::checkpoint_refs_key(cp_seq)
-        );
+    if let Some(cp) = &manifest.checkpoint {
+        let key = format!("{prefix}{}", cp.refs_key);
         let (_, b) = c
             .truth
             .get_bytes(&key)
@@ -613,10 +610,7 @@ async fn check_truth(c: &Cluster, pushers: &[Pusher]) -> Result<()> {
         );
     }
     if let Some(cp) = &manifest.checkpoint {
-        for key in [
-            walgit_proto::keys::checkpoint_key(cp.seq),
-            walgit_proto::keys::checkpoint_refs_key(cp.seq),
-        ] {
+        for key in [cp.key.clone(), cp.refs_key.clone()] {
             ensure!(
                 c.truth.exists(&format!("{prefix}{key}")).await?,
                 "checkpoint object missing: {key}"
@@ -1671,10 +1665,7 @@ async fn run_checkpoint_crash(seed: u64, crash_at: &str) -> Result<()> {
     let m = c.truth_manifest().await?;
     ensure!(m.checkpoint.as_ref().map(|x| x.seq) == Some(before.head_seq));
     // The committed checkpoint's objects exist and a cold start folds from it.
-    for key in [
-        walgit_proto::keys::checkpoint_key(cp.seq),
-        walgit_proto::keys::checkpoint_refs_key(cp.seq),
-    ] {
+    for key in [cp.key.clone(), cp.refs_key.clone()] {
         ensure!(
             c.truth
                 .head(&format!("{}{}", c.repo_prefix(), key))
@@ -2560,3 +2551,43 @@ async fn sim_cache_pressure_keeps_pinned_repos_and_refuses_too_large() {
 
 #[allow(dead_code)]
 fn _unused(_: WalError) {}
+
+/// A prepared older checkpoint cannot replace a newer checkpoint after another
+/// push advances head beyond both. Sequence equality with current head is not enough.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn checkpoint_retry_never_regresses_a_newer_checkpoint() -> Result<()> {
+    let c = Cluster::new(63, 2).await?;
+    let mut p = Pusher::new(0);
+    ensure!(
+        p.push_once(&c.instances[0], &c.id, Duration::from_secs(10))
+            .await?
+    );
+    let old = c.instances[0].open(&c.id).await?;
+    let old_seq = old.manifest().head_seq;
+    let gate = c.instances[0].link.gate_next("put", "checkpoint.pb");
+    let pending = tokio::spawn(async move { old.write_checkpoint().await });
+    tokio::time::timeout(Duration::from_secs(10), gate.entered()).await?;
+
+    ensure!(
+        p.push_once(&c.instances[1], &c.id, Duration::from_secs(10))
+            .await?
+    );
+    let newer = c.instances[1].open(&c.id).await?;
+    let checkpoint = newer.write_checkpoint().await?;
+    ensure!(checkpoint.seq > old_seq);
+    ensure!(
+        p.push_once(&c.instances[1], &c.id, Duration::from_secs(10))
+            .await?
+    );
+    ensure!(c.truth_manifest().await?.head_seq > checkpoint.seq);
+
+    gate.release();
+    let observed = tokio::time::timeout(Duration::from_secs(10), pending).await???;
+    ensure!(
+        observed == checkpoint,
+        "old writer did not adopt the newer checkpoint"
+    );
+    ensure!(c.truth_manifest().await?.checkpoint == Some(checkpoint));
+    check_truth(&c, std::slice::from_ref(&p)).await?;
+    Ok(())
+}

@@ -23,7 +23,7 @@ Ref advertisement chooses names to show. Named object groups choose logical reac
 segments choose physical object types. These policies must not be conflated or treated as access controls.
 All outputs belong to the same ordinary Git object database.
 
-Proposed group configuration (not available in the removal-only review unit):
+Group configuration (available in the coverage foundation; transport wiring follows separately):
 
 ```toml
 [refs]

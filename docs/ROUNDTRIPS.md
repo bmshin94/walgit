@@ -41,6 +41,7 @@ right shape. This document is the thinking tool; apply it to every protocol chan
 |---|---|---|---|
 | Any read (`info/refs`, ls-refs, web refs/resolve) | 1 cond GET (or 0 within `freshness_ttl`) | 1 | `sync.rs::freshness_check` |
 | Cold Refs sync | 1 manifest GET → 1 round (checkpoint refs ∥ log tail segments) | no checkpoint: 1 + tail (2 with one segment); checkpoint: 2 + tail | `registry.rs::open`, `sync.rs` |
+| Old checkpoint without inline refs descriptor | manifest GET → committed checkpoint metadata GET → its refs GET (tail can overlap) | one additional GET compared with a new descriptor; the old address must come from committed metadata, never a guessed sequence path | `snapshots.rs::checkpoint_snapshot` |
 | Push request / publish (`process_batch`) | 1 freshness GET → pack PUT ∥ idx PUT ∥ log PUT (1 round) → manifest CAS (1 round) | request: 5; already-synced publish: 4 | `publish.rs` |
 | Compaction publish | same shape as push | — | `publish.rs::publish_compact_impl` |
 | Checkpoint | 1 cond GET (freshness) → refs PUT ∥ checkpoint PUT → manifest CAS | 3 rounds, 4 requests (was 6/6 until 2026-08-22: a bundle-list GET before the checkpoint PUT and a log GET for provenance times sat in the chain; times now come from the writer's own applied state, `bundle_key` is no longer looked up) | `checkpoint.rs` |
@@ -49,6 +50,7 @@ right shape. This document is the thinking tool; apply it to every protocol chan
 | Publish, local commit (2026-08-23) | unchanged in round trips: after the manifest CAS the ref txns are applied to the local copy **before** the new manifest version is advertised, both under `sync_mutex` (the refs phase of every sync); the reverse order let a reader cache the old refs under the new version, and without the lock a concurrent sync replayed the same entry (two `update-ref`, a lock collision). A landed CAS is answered `ok` whatever the local apply does — the next sync replays (one conditional GET that then returns 200, no extra write). | 0 extra | `publish.rs::process_batch` |
 | Repository listing (`/api/v1/owners*`, `/services/api/owners*`, maintainer/bridge passes) | 0 within `LIST_TTL` (30 s, per instance); else delimited `repos/` → (delimited `repos/<o>/` ∥ owners) → (HEAD `manifest.pb` ∥ repos): 3 rounds | 1 + owners + repos | `registry.rs::list` |
 | Bundle removal (2026-09-11) | v2 capabilities and narrated fetch: removed optional list GET (1 → 0 extra); maintenance no longer reads/CASes a bundle list; direct import no longer composes a wrapper or reads/CASes a bundle list | no new store requests; checkpoint and push budgets unchanged | `smart.rs`, `maintain.rs`, `import_direct.rs` |
+| Canonical checkpoint publication | unchanged: freshness → content-addressed refs PUT ∥ attempt-specific metadata PUT → manifest CAS | 4 healthy requests; equality verification GET only after immutable Create conflict | `checkpoint.rs`, `snapshots.rs` |
 | Orphan log slot (failure path only) | +1 fresh manifest GET, +HEAD per probe, +Create at next seq | — | `publish.rs::claim_log_slot` |
 
 `healthy_request_round_trip_budgets` in `crates/walgit-server/tests/sim.rs` pins the healthy MemoryStore

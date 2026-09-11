@@ -192,3 +192,22 @@ lock_wait_warn = "1s"             # WARN "lock wait" (lock, repo, wait_ms, reque
 # webhook_url = "https://hooks.example.com/walgit"   # each batch of ref events is POSTed as a JSON array
 # webhook_secret = ""             # X-Walgit-Signature: sha256=<HMAC-SHA256 of the body>; unset = unsigned
 # sweep_interval = "5m"           # backstop + health check (warns when a sweep finds unpublished entries); 0 = off
+
+# Packfile foundations: these policies are validated and stored, but URI delivery and
+# ref filtering are not enabled by the foundation-only change.
+[refs]
+advertise = ["refs/heads/*", "refs/tags/*"] # discovery policy, independent of packing identity
+[refs.packfiles.code]
+kind = "code"                     # excludes metadata by kind, not an access control
+include = ["refs/*"]              # exact/trailing-prefix selectors; HEAD uses captured symbolic target
+subtract = []                     # code-group dependencies; complete same-generation proof required
+[refs.packfiles.meta]
+kind = "meta"
+include = ["refs/meta", "refs/meta/*"]
+subtract = []
+
+[packfile_uri]
+uri_min_bytes = "32MiB"           # at least one useful pack; smaller required companions may accompany it
+max_uris_per_fetch = 64           # complete sets only; over-cap selections fall back dynamically
+refuse_packfile_incompatible_git = true
+refuse_unbounded_clone_without_uris = false # ordinary compatible clients retain dynamic fallback

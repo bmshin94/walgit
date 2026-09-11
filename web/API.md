@@ -265,12 +265,12 @@ removes it (admin permission) — the same handlers as `PUT|DELETE /{owner}/{rep
 `GET|PUT|DELETE …/policy` is the push policy document (`docs/POLICY.md`).
 
 `GET|PUT|DELETE /{o}/{r}/api/settings` (D24, 2026-08-21) is the repository's **settings in the WAL**: a TOML document
-restricted to `[maintenance]`, `[compaction]` and `[upstream]`, merged over the
+restricted to `[refs]`, `[packfile_uri]`, `[maintenance]`, `[compaction]` and `[upstream]`, merged over the
 host's config (`effective config`).
 `GET` → `{revision, author, updated_at, message, toml}` (`revision: 0` = none). `PUT` body = the TOML
 (`?message=` optional), validated against the serving host's build — 400 with the reason and nothing published
 on failure; 200 `{revision}`. `DELETE` publishes an empty document. `GET …/settings/effective` → the effective
-`[maintenance]`/`[compaction]`/`[upstream]` as TOML (`application/toml`; no host secrets,
+allowed sections as TOML (`application/toml`; no host secrets,
 no `token_env`); `GET …/settings/history` → `{min_seq, entries:[{seq,revision,author,message,
 at,toml}]}` from the live log (older changes are folded into checkpoints). All `no-store`; PUT/DELETE need
 **admin** (`tokens[].admin` or oidc `admin_emails`/`admin_domains`; `mode = none` is admin on loopback).

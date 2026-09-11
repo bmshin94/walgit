@@ -714,7 +714,7 @@ export class RepoClient {
       }),
   };
 
-  /** D24: WAL-backed TOML overrides of [maintenance], [compaction] and [upstream]. */
+  /** WAL-backed TOML overrides, including ref/group and pack delivery policy. */
   readonly settings = {
     /** The settings document (`revision: 0` = none). */
     get: (opts?: CallOptions) => this.client.json<RepoSettings>(`${this.p}/settings`, opts),
@@ -731,7 +731,7 @@ export class RepoClient {
     effective: (opts?: CallOptions) => this.client.text(`${this.p}/settings/effective`, opts),
     /** SETTINGS entries in the live log, oldest first. */
     history: (opts?: CallOptions) => this.client.json<SettingsHistory>(`${this.p}/settings/history`, opts),
-    /** Everything the Settings tab shows: strategies with next fire, placement, fields with sources. */
+    /** Effective placement and configuration fields with their sources. */
     describe: (opts?: CallOptions) => this.client.json<SettingsDescribe>(`${this.p}/settings/describe`, opts),
     /** Validate a document and preview the resulting effective config, without publishing. */
     validate: (toml: string, opts?: CallOptions) =>

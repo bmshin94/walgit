@@ -7,7 +7,7 @@ use crate::store_proto::{get_message, get_message_if_changed};
 use tracing::Instrument;
 use walgit_git::LocalRepo;
 use walgit_proto::keys;
-use walgit_proto::v1::{EntryKind, LogEntry, Manifest, PackRef, RefSnapshot};
+use walgit_proto::v1::{EntryKind, LogEntry, Manifest, PackRef};
 use walgit_store::{GetOptions, GetResult, ObjectStore, Prefixed, Version};
 
 /// A read guard held for the lifetime of a request. While any guard is alive
@@ -91,7 +91,7 @@ pub(crate) async fn freshness_check(
     store: &Prefixed,
     known: Option<&Version>,
 ) -> Result<SyncOutcome, WalError> {
-    match known {
+    let outcome = match known {
         Some(v) => match get_message_if_changed::<Manifest>(store, keys::MANIFEST, v).await? {
             None => Ok(SyncOutcome::Unchanged),
             Some((meta, manifest)) => Ok(SyncOutcome::Changed {
@@ -106,7 +106,11 @@ pub(crate) async fn freshness_check(
                 manifest: std::sync::Arc::new(manifest),
             }),
         },
+    }?;
+    if let SyncOutcome::Changed { manifest, .. } = &outcome {
+        crate::validate_manifest(manifest)?;
     }
+    Ok(outcome)
 }
 
 /// Download a pack+idx from the store and install it into the local repo.
@@ -204,7 +208,7 @@ pub(crate) async fn download_and_install_pack(
         .install_pack(&pack_path, &idx_path, &extra)
         .instrument(span.clone())
         .await?;
-    if pack.kind == walgit_proto::v1::PackKind::History as i32 {
+    if pack.kind == walgit_proto::v1::PackKind::History as i32 && pack.pack_groups.is_empty() {
         local.mark_history_pack(&oid, &pack.derived_from).await?;
         tracing::info!(checksum = %checksum, base = %pack.derived_from, bytes = pack.pack_size, "history pack installed (commits + trees local)");
     }
@@ -438,7 +442,6 @@ pub(crate) async fn apply_delta(
     new_manifest: &Manifest,
     new_version: &Version,
 ) -> Result<(), WalError> {
-    let store = &handle.store;
     let local = &handle.local;
     let current_state = handle.state.lock().clone();
 
@@ -451,11 +454,15 @@ pub(crate) async fn apply_delta(
     // carry none, the object always does.
     handle.learn_checkpoint_times().await?;
     if need_checkpoint_load {
-        let refs_key = keys::checkpoint_refs_key(checkpoint_seq);
-        if let Some((_, snap)) = get_message::<RefSnapshot>(store, &refs_key).await? {
-            local.load_ref_snapshot(&snap)?;
-            handle.state.lock().applied_seq = checkpoint_seq;
-        }
+        let cp = new_manifest
+            .checkpoint
+            .as_ref()
+            .ok_or_else(|| WalError::Corrupt("missing checkpoint descriptor".into()))?;
+        let snap =
+            crate::snapshots::checkpoint_snapshot(&handle.store, cp, &new_manifest.object_format)
+                .await?;
+        local.load_ref_snapshot(&snap)?;
+        handle.state.lock().applied_seq = checkpoint_seq;
     }
 
     // Replay log entries (refs, and superseded-pack bookkeeping) from

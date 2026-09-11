@@ -101,6 +101,8 @@ impl Registry {
             return Err(WalError::NotFound);
         };
 
+        crate::validate_manifest(&manifest)?;
+
         // Open or init local repo (LocalRepo joins owner/name.git onto the root).
         let local = if let Some(l) = LocalRepo::open(&self.cache_root, id)? {
             l
@@ -112,7 +114,8 @@ impl Registry {
         // Load state
         let state = load_state(local.path());
 
-        let state_is_behind = state.applied_seq < manifest.head_seq;
+        let state_is_behind =
+            state.applied_seq < manifest.head_seq || state.revision != manifest.revision;
         let manifest_version = meta.version.clone();
 
         let handle = RepoHandle::new(
@@ -215,6 +218,7 @@ impl Registry {
             writer: crate::handle::instance_id(),
             revision: 1,
             settings: None,
+            retired_packs: Vec::new(),
         };
 
         let buf = manifest.encode_to_vec();

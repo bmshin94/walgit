@@ -368,6 +368,24 @@ impl RepoHandle {
         self.manifest.read().clone()
     }
 
+    /// Capture the exact manifest and its CAS token atomically.
+    pub fn manifest_pair(&self) -> (Arc<Manifest>, Option<Version>) {
+        let manifest = self.manifest.read();
+        (manifest.clone(), self.manifest_version.lock().clone())
+    }
+
+    /// Caller serializes ref application with `sync_mutex`. A late successful
+    /// publisher must not roll a cache back after another request synced ahead.
+    pub(crate) fn adopt_manifest(&self, manifest: Arc<Manifest>, version: Version) -> bool {
+        let mut current = self.manifest.write();
+        if current.revision > manifest.revision {
+            return false;
+        }
+        *self.manifest_version.lock() = Some(version);
+        *current = manifest;
+        true
+    }
+
     pub fn manifest_version(&self) -> Option<Version> {
         self.manifest_version.lock().clone()
     }
@@ -788,7 +806,7 @@ impl RepoHandle {
 
     /// Freshness check + refs apply, with `sync_mutex` and the write lock held
     /// by the caller. Packs are never touched here (see `sync_packs_phase`).
-    async fn sync_locked_inner(&self, span: &tracing::Span) -> Result<(), WalError> {
+    pub(crate) async fn sync_locked_inner(&self, span: &tracing::Span) -> Result<(), WalError> {
         let known = self.manifest_version.lock().clone();
         let outcome = crate::sync::freshness_check(&self.store, known.as_ref()).await?;
         match outcome {
@@ -814,7 +832,7 @@ impl RepoHandle {
                 if initialised && manifest.revision == cur.revision {
                     // Same content under a version we did not record (a publish that learned the version
                     // by HEAD): adopt the version so the next check is a 304, apply nothing.
-                    *self.manifest_version.lock() = Some(meta_version);
+                    self.adopt_manifest(manifest.clone(), meta_version);
                     self.update_freshness();
                     return Ok(());
                 }
@@ -822,8 +840,7 @@ impl RepoHandle {
                 let before = self.state.lock().applied_seq;
                 crate::sync::apply_delta(self, &manifest, &meta_version).await?;
                 span.record("entries_applied", manifest.head_seq.saturating_sub(before));
-                *self.manifest.write() = manifest;
-                *self.manifest_version.lock() = Some(meta_version);
+                self.adopt_manifest(manifest, meta_version);
                 self.update_freshness();
             }
         }
@@ -906,11 +923,12 @@ impl RepoHandle {
             return Err(WalError::NotFound);
         };
 
+        crate::validate_manifest(&manifest)?;
+
         // Reset state and re-materialize
         crate::sync::materialize_from_scratch(self, &manifest, &meta.version).await?;
 
-        *self.manifest.write() = Arc::new(manifest);
-        *self.manifest_version.lock() = Some(meta.version);
+        self.adopt_manifest(Arc::new(manifest), meta.version);
         self.last_freshness.lock().take();
 
         Ok(())
@@ -1025,6 +1043,27 @@ impl RepoHandle {
         crate::publish::publish_compact_impl(self, new_pack, supersedes, tier).await
     }
 
+    /// Publish a producer-proved classified pack and its exact coverage input.
+    /// Graph closure and conservation remain obligations of the producer.
+    pub async fn publish_compact_covering(
+        &self,
+        new_pack: walgit_git::PackInfo,
+        supersedes: Vec<gix_hash::ObjectId>,
+        tier: u32,
+        classification: &crate::PackClassification,
+        snapshots: &[crate::CoverageSnapshot],
+    ) -> Result<u64, WalError> {
+        crate::publish::publish_compact_classified(
+            self,
+            new_pack,
+            supersedes,
+            tier,
+            Some(classification),
+            snapshots,
+        )
+        .await
+    }
+
     /// D24: the repository's settings as last applied (manifest-inline).
     pub fn settings(&self) -> Option<walgit_proto::v1::RepoSettings> {
         self.manifest().settings.clone()
@@ -1037,7 +1076,8 @@ impl RepoHandle {
     /// against this build fall back to the host config with a warning
     /// (never a failure on a read path).
     pub fn effective_config(&self) -> Arc<walgit_config::Config> {
-        let settings = self.settings();
+        let manifest = self.manifest();
+        let settings = &manifest.settings;
         let rev = settings.as_ref().map_or(0, |s| s.revision);
         if rev == 0 {
             return self.cfg.clone();
@@ -1047,7 +1087,29 @@ impl RepoHandle {
         {
             return c.clone();
         }
-        let toml = settings.as_ref().map_or("", |s| s.toml.as_str());
+        let cfg = self.config_for_manifest(&manifest);
+        *self.effective.lock() = Some((rev, cfg.clone()));
+        cfg
+    }
+
+    /// Validate the effective policy for exactly the currently held generation.
+    pub fn validated_effective_config(&self) -> Result<Arc<walgit_config::Config>, WalError> {
+        self.validated_config_for_manifest(&self.manifest())
+    }
+
+    pub(crate) fn config_for_manifest(&self, manifest: &Manifest) -> Arc<walgit_config::Config> {
+        self.validated_config_for_manifest(manifest).unwrap_or_else(|e| {
+            tracing::warn!(repo = %self.id, error = %e, "repo settings do not apply to this build; using the host config");
+            self.cfg.clone()
+        })
+    }
+
+    pub(crate) fn validated_config_for_manifest(
+        &self,
+        manifest: &Manifest,
+    ) -> Result<Arc<walgit_config::Config>, WalError> {
+        let toml = manifest.settings.as_ref().map_or("", |s| s.toml.as_str());
+        let rev = manifest.settings.as_ref().map_or(0, |s| s.revision);
         // Bucket-data compatibility, deliberately absent from Config::with_settings:
         // host files and new settings writes must reject the removed section.
         let migrated = (toml.len() <= walgit_config::SETTINGS_MAX_BYTES)
@@ -1064,15 +1126,10 @@ impl RepoHandle {
             tracing::warn!(repo = %self.id, revision = rev,
                 "migrating saved repo settings for bundle removal: ignoring [bundles] in effective config; durable settings and history are unchanged");
         }
-        let cfg = match self.cfg.with_settings(migrated.as_deref().unwrap_or(toml)) {
-            Ok(c) => Arc::new(c),
-            Err(e) => {
-                tracing::warn!(repo = %self.id, revision = rev, error = %e, "repo settings do not apply to this build; using the host config");
-                self.cfg.clone()
-            }
-        };
-        *self.effective.lock() = Some((rev, cfg.clone()));
-        cfg
+        self.cfg
+            .with_settings(migrated.as_deref().unwrap_or(toml))
+            .map(Arc::new)
+            .map_err(|e| WalError::Invalid(format!("saved settings revision {rev}: {e:#}")))
     }
 
     /// D24: validate and publish new settings (whole-document replace): a

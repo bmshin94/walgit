@@ -2,6 +2,9 @@
 //! `WALGIT__SECTION__KEY=value` (double underscore = nesting), applied after
 //! the file is parsed. `PORT` (a serverless host) overrides `server.listen` port.
 
+pub mod refs;
+pub use refs::{PackGroupConfig, PackGroupKind, RefsConfig};
+
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
@@ -18,6 +21,8 @@ pub struct Config {
     pub cache: CacheConfig,
     pub wal: WalConfig,
     pub compaction: CompactionConfig,
+    pub refs: RefsConfig,
+    pub packfile_uri: PackfileUriConfig,
     pub maintenance: MaintenanceConfig,
     pub placement: PlacementConfig,
     pub lfs: LfsConfig,
@@ -701,7 +706,13 @@ fn default_true() -> bool {
 }
 
 /// D24: the top-level sections a repository's settings may override.
-pub const SETTINGS_SECTIONS: &[&str] = &["maintenance", "compaction", "upstream"];
+pub const SETTINGS_SECTIONS: &[&str] = &[
+    "maintenance",
+    "compaction",
+    "upstream",
+    "refs",
+    "packfile_uri",
+];
 /// D24: maximum size of a settings document.
 pub const SETTINGS_MAX_BYTES: usize = 16 * 1024;
 
@@ -1108,6 +1119,15 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
+        self.refs.validate()?;
+        anyhow::ensure!(
+            self.packfile_uri.uri_min_bytes.as_u64() > 0,
+            "packfile_uri.uri_min_bytes must be positive"
+        );
+        anyhow::ensure!(
+            (1..=64).contains(&self.packfile_uri.max_uris_per_fetch),
+            "packfile_uri.max_uris_per_fetch must be 1..=64"
+        );
         anyhow::ensure!(!self.store.bucket.is_empty(), "store.bucket must be set");
         let t = &self.server.tls;
         match t.mode {
@@ -1685,5 +1705,25 @@ webhook_secret = "s"
         assert_eq!(c.events.webhook_secret.as_deref(), Some("s"));
         let err = Config::parse("[events]\nwebhook_url = \"ftp://x\"\n").unwrap_err();
         assert!(err.to_string().contains("webhook_url"), "{err}");
+    }
+}
+
+/// Negotiated static delivery thresholds. Foundation only: no URI emission yet.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct PackfileUriConfig {
+    pub uri_min_bytes: ByteSize,
+    pub max_uris_per_fetch: usize,
+    pub refuse_packfile_incompatible_git: bool,
+    pub refuse_unbounded_clone_without_uris: bool,
+}
+impl Default for PackfileUriConfig {
+    fn default() -> Self {
+        Self {
+            uri_min_bytes: ByteSize::mib(32),
+            max_uris_per_fetch: 64,
+            refuse_packfile_incompatible_git: true,
+            refuse_unbounded_clone_without_uris: false,
+        }
     }
 }

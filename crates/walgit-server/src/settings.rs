@@ -78,7 +78,8 @@ pub async fn http_effective(
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     let text = h
-        .effective_config()
+        .validated_effective_config()
+        .map_err(|e| ApiError::Internal(e.to_string()))?
         .public_settings_toml()
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok((
@@ -232,7 +233,9 @@ pub async fn http_describe(
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     let settings = h.settings();
-    let effective = h.effective_config();
+    let effective = h
+        .validated_effective_config()
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok((
         StatusCode::OK,
         [(axum::http::header::CACHE_CONTROL, "no-store")],
