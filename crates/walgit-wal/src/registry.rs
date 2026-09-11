@@ -478,6 +478,9 @@ fn dir_size(path: &std::path::Path) -> u64 {
 }
 
 /// (used, total) bytes of the filesystem holding `path` (statvfs).
+// statvfs's block fields are u32 on macOS and u64 on Linux, so `as u64` is the one spelling
+// that is lossless on both; `From` would be a useless conversion on Linux.
+#[allow(clippy::cast_lossless)]
 fn disk_usage(path: &std::path::Path) -> Option<(u64, u64)> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
