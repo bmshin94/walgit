@@ -1,4 +1,4 @@
-//! Git smart HTTP server (protocol v0/v2), LFS, bundle serving, admin, health, metrics.
+//! Git smart HTTP server (protocol v0/v2), LFS, admin, health, metrics.
 //! See AGENTS.md Phase 3.
 #![allow(
     clippy::case_sensitive_file_extension_comparisons,
@@ -33,7 +33,6 @@
 pub mod admin;
 pub mod auth;
 pub mod bridge;
-pub mod bundles;
 pub mod cache;
 pub mod error;
 pub mod events;
@@ -84,7 +83,6 @@ pub struct AppState {
     pub cfg: Arc<walgit_config::Config>,
     pub store: DynStore,
     pub registry: Arc<walgit_wal::Registry>,
-    pub bundles: Arc<walgit_bundle::Bundler>,
     pub auth: Arc<auth::Authenticator>,
     pub semaphores: middleware::RepoSemaphores,
     /// HTTP requests in flight (counted until the response body is done); on the watchdog line.
@@ -113,9 +111,6 @@ impl AppState {
     ) -> anyhow::Result<Arc<Self>> {
         let registry = walgit_wal::Registry::new(store.clone(), cfg.clone());
         let bridge = bridge::Bridge::new(&cfg, registry.clone());
-        let bundle_source: Arc<dyn walgit_bundle::BundleSource> =
-            Arc::new(RegistryBundleSource(registry.clone()));
-        let bundles = walgit_bundle::Bundler::new_with_source(bundle_source, cfg.clone());
         let metrics_handle = metrics::install()?;
         let tls = tls::load(&cfg)?;
         if let Some(t) = &tls {
@@ -125,7 +120,6 @@ impl AppState {
             cfg: cfg.clone(),
             store,
             registry,
-            bundles,
             auth: auth::Authenticator::new(&cfg),
             semaphores: middleware::RepoSemaphores::new(cfg.server.max_concurrent_per_repo),
             inflight: Arc::new(middleware::Inflight::default()),
@@ -143,7 +137,7 @@ impl AppState {
 /// Build a full axum router.
 pub fn router(state: Arc<AppState>) -> Router {
     // Dynamic web responses (JSON API, SPA index/overview) are compressed on
-    // the fly; git smart-HTTP, bundles and LFS bytes never are (packs are
+    // the fly; git smart-HTTP and LFS bytes never are (packs are
     // already compressed, and `Content-Length`/`Range` must stay exact).
     // Embedded `/_ui/assets` arrive precompressed from the build and carry
     // their own `Content-Encoding`, which this layer leaves untouched; SSE is
@@ -354,7 +348,7 @@ pub(crate) fn request_peer(req: &Request<Body>) -> Option<SocketAddr> {
 }
 
 /// Route a parsed repo request (`/{owner}/{repo}[.git]/<sub>` or the same sub
-/// under `/{owner}/{repo}/api[-browser]`) to git smart-HTTP, LFS, bundles,
+/// under `/{owner}/{repo}/api[-browser]`) to git smart-HTTP, LFS,
 /// repo admin and policy handlers.
 pub(crate) async fn dispatch_route(
     st: &Arc<AppState>,
@@ -396,17 +390,6 @@ pub(crate) async fn dispatch_route(
             (&Method::POST, "info/lfs/verify") => {
                 let bytes = collect_body(body.take().unwrap()).await?;
                 lfs::verify(st, route, &headers, bytes).await
-            }
-            (&Method::GET, "bundles/list") => {
-                bundles::list(st, route, &headers, &query, true).await
-            }
-            (&Method::GET, "bundles/catchup") => {
-                bundles::list(st, route, &headers, &query, false).await
-            }
-            (&Method::GET | &Method::HEAD, s)
-                if s.starts_with("bundles/") && s != "bundles/list" && s != "bundles/catchup" =>
-            {
-                bundles::object(st, route, &method, &headers, peer).await
             }
             (&Method::PUT, "") => admin::create(st, route, &headers, &query).await,
             (&Method::DELETE, "") => admin::delete(st, route, &headers).await,
@@ -661,118 +644,6 @@ pub fn listen_url(cfg: &walgit_config::Config) -> String {
 /// Phase-1 bound: how long an interrupted unit may take to be gone (its future
 /// is dropped on abort; a blocking git child is left to die with the container).
 const UNIT_STOP_MAX: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// Server-side adapter implementing `walgit_bundle::BundleSource` over a
-/// `walgit_wal::Registry`. Defined here (server owns the type) so the orphan
-/// rule is satisfied; lets us use `Bundler::new_with_source` without waiting for
-/// a Registry impl in the bundle crate.
-struct RegistryBundleSource(Arc<walgit_wal::Registry>);
-
-#[async_trait::async_trait]
-impl walgit_bundle::BundleSource for RegistryBundleSource {
-    async fn open_repo(
-        &self,
-        id: &walgit_git::RepoId,
-    ) -> Result<walgit_bundle::BundleRepoHandle, walgit_bundle::BundleError> {
-        let h = self.0.open(id).await.map_err(|e| match e {
-            walgit_wal::WalError::NotFound => {
-                walgit_bundle::BundleError::RepoNotFound(id.to_string())
-            }
-            other => walgit_bundle::BundleError::Other(other.to_string()),
-        })?;
-        Ok(walgit_bundle::BundleRepoHandle {
-            local: h.local().clone(),
-            store: h.store().clone(),
-            head_seq: h.manifest().head_seq,
-            engine: walgit_bundle::BundleEngine::Git,
-            cfg: Some(h.effective_config()),
-        })
-    }
-
-    async fn prepare_objects(
-        &self,
-        id: &walgit_git::RepoId,
-    ) -> Result<(), walgit_bundle::BundleError> {
-        // `git bundle create` streams from the local copy: bring the packs
-        // here first (Serve level). Registry::open alone is refs-level — the
-        // maintainer built from it and git said "bad object refs/heads/main".
-        // Too-large repos fail with the "larger than this instance" message
-        // that run_all_due treats as "skipped, the VM job builds those".
-        // Never from open_repo: list/advert callers hold a read guard and a
-        // sync here would deadlock on the repo's write lock.
-        let h = self
-            .0
-            .open(id)
-            .await
-            .map_err(|e| walgit_bundle::BundleError::Other(e.to_string()))?;
-        drop(
-            h.sync()
-                .await
-                .map_err(|e| walgit_bundle::BundleError::Other(e.to_string()))?,
-        );
-        Ok(())
-    }
-
-    /// gix (+ remote faulter) when the base is remote-served or linked from
-    /// the store mount (stock git would read every boundary tree through the
-    /// mount or fail), git on a complete local copy.
-    async fn engine(&self, id: &walgit_git::RepoId) -> walgit_bundle::BundleEngine {
-        let Ok(h) = self.0.open(id).await else {
-            return walgit_bundle::BundleEngine::Git;
-        };
-        if !h.remote_served().is_empty() {
-            match h.remote_reader().await {
-                Ok(reader) => {
-                    return walgit_bundle::BundleEngine::Gix {
-                        faulter: Some(Arc::new(walgit_wal::remote::Faulter::new(
-                            reader,
-                            h.local().clone(),
-                        ))),
-                    };
-                }
-                Err(e) => {
-                    tracing::warn!(repo = %id, error = %e, "remote reader unavailable for bundle build; using git");
-                }
-            }
-        }
-        let linked = h.local().packs().is_ok_and(|ps| {
-            ps.iter()
-                .any(|p| h.local().pack_path(&p.checksum).is_symlink())
-        });
-        if linked {
-            return walgit_bundle::BundleEngine::Gix { faulter: None };
-        }
-        walgit_bundle::BundleEngine::Git
-    }
-
-    async fn refs_as_of(
-        &self,
-        id: &walgit_git::RepoId,
-        at: std::time::SystemTime,
-    ) -> Result<Option<(walgit_git::RefSnapshotData, u64)>, walgit_bundle::BundleError> {
-        let h = self
-            .0
-            .open(id)
-            .await
-            .map_err(|e| walgit_bundle::BundleError::Other(e.to_string()))?;
-        let (snap, seq) = h
-            .refs_as_of(at)
-            .await
-            .map_err(|e| walgit_bundle::BundleError::Other(e.to_string()))?;
-        if seq == 0 {
-            return Ok(None); // nothing at that time (or predates replayable history)
-        }
-        Ok(Some((snap.into(), seq)))
-    }
-
-    async fn list_repos(&self) -> Result<Vec<walgit_git::RepoId>, walgit_bundle::BundleError> {
-        Ok(self
-            .0
-            .list()
-            .await
-            .map_err(|e| walgit_bundle::BundleError::Other(e.to_string()))?)
-    }
-}
 
 #[cfg(test)]
 mod listen_tests {

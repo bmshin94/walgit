@@ -79,8 +79,7 @@ async fn compact_one(
     .await?;
     let mut summary = outcome.summary();
     if base {
-        // The weekly bundle is composed from this base with the refs at its
-        // seq: write the checkpoint now so `walgit bundle compose` finds them.
+        // Checkpoint the rebuilt pack set so cold readers can install it directly.
         let cp = handle.write_checkpoint().await?;
         {
             let _ = std::fmt::Write::write_fmt(

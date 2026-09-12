@@ -30,6 +30,7 @@ async fn info_refs_v2_advertises_capabilities() -> TestResult {
     assert!(out.contains("version 2"));
     assert!(out.contains("ls-refs=unborn"));
     assert!(out.contains("fetch=shallow wait-for-done"));
+    assert!(!out.contains("bundle-uri"), "{out}");
     Ok(())
 }
 
@@ -66,6 +67,25 @@ async fn push_clone_roundtrip_v2() -> TestResult {
     let src_head = git_in(&src, &["rev-parse", "main"])?;
     let cl_head = git_in(clone_dir.path(), &["rev-parse", "main"])?;
     assert_eq!(src_head.trim(), cl_head.trim());
+    // Ordinary Git transfer remains complete after removing the bundle runtime.
+    for suffix in [
+        "bundles/list",
+        "bundles/catchup",
+        "bundles/weekly/example.bundle",
+    ] {
+        assert_eq!(server.get_status(&format!("/t/r.git/{suffix}")).await?, 404);
+    }
+    let command = "command=bundle-uri\n";
+    let response = reqwest::Client::new()
+        .post(format!("{}/git-upload-pack", server.repo_url("t", "r")))
+        .header("Git-Protocol", "version=2")
+        .header("Content-Type", "application/x-git-upload-pack-request")
+        .body(format!("{:04x}{command}00010000", command.len() + 4))
+        .send()
+        .await?;
+    assert_eq!(response.status(), 400);
+    assert!(response.text().await?.contains("unknown v2 command"));
+
     Ok(())
 }
 
@@ -812,64 +832,6 @@ async fn sha256_repo_roundtrip() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn bundle_uri_clone_fetches_server_bundle() -> TestResult {
-    let server = Server::start().await?;
-    server.put_repo("t", "bundled").await?;
-    let src = TestRepo::synthetic(3, 2)?;
-    git_in(&src, &["branch", "-M", "main"])?;
-    git_in(
-        &src,
-        &["remote", "add", "origin", &server.repo_url("t", "bundled")],
-    )?;
-    git_in(&src, &["push", "origin", "main"])?;
-    server.build_bundle("t", "bundled", "weekly").await?;
-
-    // The WAL page shows exactly the URI the bundle list advertises, and it downloads.
-    let bundle_list = format!("{}/t/bundled/bundles/list", server.base_url);
-    let list_text = reqwest::get(&bundle_list).await?.text().await?;
-    let overview: serde_json::Value =
-        reqwest::get(format!("{}/t/bundled/api/overview", server.base_url))
-            .await?
-            .json()
-            .await?;
-    let ui_uri = overview["bundles"][0]["uri"]
-        .as_str()
-        .expect("overview bundle uri")
-        .to_string();
-    assert!(
-        list_text.contains(&format!("uri = {ui_uri}")),
-        "overview uri {ui_uri} not in list:\n{list_text}"
-    );
-    let head = reqwest::Client::new().head(&ui_uri).send().await?;
-    assert_eq!(
-        head.status(),
-        200,
-        "overview bundle uri must be downloadable"
-    );
-
-    let clone_dir = tempfile::tempdir()?;
-    git(
-        &[
-            "-c",
-            "transfer.bundleURI=true",
-            "clone",
-            "--branch",
-            "main",
-            "--bundle-uri",
-            &bundle_list,
-            &server.repo_url("t", "bundled"),
-            clone_dir.path().to_str().unwrap(),
-        ],
-        clone_dir.path().parent().unwrap(),
-    )?;
-    assert_eq!(
-        git_in(clone_dir.path(), &["rev-parse", "main"])?.trim(),
-        git_in(&src, &["rev-parse", "main"])?.trim()
-    );
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lfs_roundtrip_when_available() -> TestResult {
     if !git_lfs_present() {
         eprintln!("git lfs not present; skipping LFS test");
@@ -970,17 +932,6 @@ async fn lfs_roundtrip_when_available() -> TestResult {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn bundle_endpoints_when_landed() -> TestResult {
-    let server = Server::start().await?;
-    server.put_repo("t", "r").await?;
-    // The bundle list endpoint should respond (404 no-bundles is acceptable
-    // until the bundler has produced entries; never a 5xx).
-    let status = server.get_status("/t/r.git/bundles/list").await?;
-    assert!(status.as_u16() < 500, "bundle list returned {status}");
-    Ok(())
-}
-
 fn git_lfs_present() -> bool {
     Command::new("git")
         .args(["lfs", "version"])
@@ -1004,11 +955,11 @@ fn git_supports_sha256() -> bool {
 }
 
 /// A front whose `cache.max_bytes` cannot hold a repository's pack set must
-/// still answer every refs-level request (ls-remote v0/v2, bundle list, web
+/// still answer every refs-level request (ls-remote v0/v2, web
 /// refs) from the WAL ref snapshot, refuse object work with a readable
-/// pkt-line ERR pointing at bundle-uri, and never pull the packs.
+/// pkt-line ERR explaining the capacity limit, and never pull the packs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn huge_repo_front_serves_refs_and_bundles_without_packs() -> TestResult {
+async fn huge_repo_front_serves_refs_without_packs() -> TestResult {
     let big = Server::start().await?;
     big.put_repo("t", "huge").await?;
     let src = TestRepo::synthetic(4, 3)?;
@@ -1019,7 +970,6 @@ async fn huge_repo_front_serves_refs_and_bundles_without_packs() -> TestResult {
         &["remote", "add", "origin", &big.repo_url("t", "huge")],
     )?;
     git_in(&src, &["push", "origin", "main", "v1"])?;
-    big.build_bundle("t", "huge", "weekly").await?;
 
     // Second front: 1 byte of pack cache.
     let small = big
@@ -1048,10 +998,7 @@ async fn huge_repo_front_serves_refs_and_bundles_without_packs() -> TestResult {
             "peeled tag from snapshot (v{proto}): {out}"
         );
     }
-    // Bundle list + web refs work.
-    let list = reqwest::get(format!("{}/t/huge/bundles/list", small.base_url)).await?;
-    assert_eq!(list.status(), 200);
-    assert!(list.text().await?.contains("version = 1"));
+    // Web refs work without object materialization.
     let refs = reqwest::get(format!("{}/t/huge/api/refs", small.base_url)).await?;
     assert_eq!(refs.status(), 200);
     let refs: serde_json::Value = refs.json().await?;
@@ -1059,24 +1006,14 @@ async fn huge_repo_front_serves_refs_and_bundles_without_packs() -> TestResult {
     let resolved = reqwest::get(format!("{}/t/huge/api/resolve/main", small.base_url)).await?;
     assert_eq!(resolved.status(), 200);
 
-    // Object work is refused with the bundle-uri hint, not a crash/OOM.
+    // Object work is refused with a capacity explanation.
     let clone_dir = tempfile::tempdir()?;
     let err = git(
-        &[
-            "-c",
-            "transfer.bundleURI=false",
-            "clone",
-            &url,
-            clone_dir.path().to_str().unwrap(),
-        ],
+        &["clone", &url, clone_dir.path().to_str().unwrap()],
         clone_dir.path().parent().unwrap(),
     )
     .unwrap_err()
     .to_string();
-    assert!(
-        err.contains("transfer.bundleURI"),
-        "clone error should explain bundle-uri: {err}"
-    );
     assert!(err.contains("larger than this instance"), "{err}");
     // The small front never downloaded the pack set.
     assert!(
@@ -1084,15 +1021,10 @@ async fn huge_repo_front_serves_refs_and_bundles_without_packs() -> TestResult {
         "small front must not materialize packs"
     );
 
-    // And with bundle-uri the clone gets its objects from the bundle; the final
-    // fetch against the small front is the part that still needs objects (today it
-    // fails the same way), so clone via the big front for the bytes and check the
-    // small front only rendered refs.
+    // A capacity-suitable front still supports an ordinary clone.
     let clone2 = tempfile::tempdir()?;
     git(
         &[
-            "-c",
-            "transfer.bundleURI=true",
             "clone",
             &big.repo_url("t", "huge"),
             clone2.path().to_str().unwrap(),
@@ -1104,7 +1036,7 @@ async fn huge_repo_front_serves_refs_and_bundles_without_packs() -> TestResult {
 }
 
 /// The server narrates a v2 fetch over sideband (band 2 → `remote: * …`):
-/// auth, WAL seq, bundle facts, local copy state — before upload-pack's own
+/// auth, WAL seq, local copy state — before upload-pack's own
 /// progress. Requires sideband-all (advertised with the git engine).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fetch_is_narrated_over_sideband() -> TestResult {
@@ -1151,7 +1083,7 @@ async fn fetch_is_narrated_over_sideband() -> TestResult {
     println!("{stderr}");
     // `no-progress` is honoured: git sends it for its own lazy promisor fetches (blobs during a
     // sparse checkout of a blobless clone) and for any non-tty fetch without --progress; those
-    // must not be narrated — a large repository clone whose bundles cover the tips therefore shows no
+    // must not be narrated — an up-to-date client therefore sees no
     // `remote: *` lines at all (2026-08-22 gate 4), by design, not because the SSD host is silent.
     let quiet = tempfile::tempdir()?;
     let out = std::process::Command::new("git")
@@ -1177,7 +1109,7 @@ async fn fetch_is_narrated_over_sideband() -> TestResult {
 /// fetch` anyway: the base is remote-served (commit-graph layer local, data by
 /// range read through the remote reader), recent packs are local, and the gix
 /// engine enumerates by tree diff against the client's haves. The client
-/// cloned from a big front (stand-in for bundle-uri) and fetches a later push
+/// cloned from a big front and fetches a later push
 /// from the small one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fetch_from_front_that_serves_the_base_remotely() -> TestResult {
@@ -1227,9 +1159,7 @@ async fn fetch_from_front_that_serves_the_base_remotely() -> TestResult {
     );
     let base_tip = git_in(&src, &["rev-parse", "main"])?.trim().to_string();
 
-    // Weekly full bundle at the base (what the VM job's compose would give).
-    big.build_bundle("t", "rbase", "weekly").await?;
-    // Client: full clone from the big front (what bundle-uri would give it).
+    // Client: full clone from the big front.
     let clone = tempfile::tempdir()?;
     git(
         &[
@@ -1291,39 +1221,6 @@ async fn fetch_from_front_that_serves_the_base_remotely() -> TestResult {
             .exists()
     );
 
-    // Incremental bundle built on the small front with the gix engine (the
-    // weekly full one exists from the big front): verifies and applies on a
-    // clone that has the base.
-    let entry = small.state.bundles.build(&id, "daily").await?;
-    assert_eq!(entry.kind, "incremental");
-    let bundle_bytes = reqwest::get(format!(
-        "{}/t/rbase.git/bundles/{}",
-        small.base_url,
-        entry.key.trim_start_matches("bundles/")
-    ))
-    .await?;
-    assert_eq!(bundle_bytes.status(), 200, "{}", entry.key);
-    let bundle_path = clone.path().join("daily.bundle");
-    std::fs::write(&bundle_path, bundle_bytes.bytes().await?)?;
-    let verify = std::process::Command::new("git")
-        .current_dir(clone.path())
-        .args(["bundle", "verify", bundle_path.to_str().unwrap()])
-        .output()?;
-    assert!(
-        verify.status.success(),
-        "{}",
-        String::from_utf8_lossy(&verify.stderr)
-    );
-    let out = std::process::Command::new("git")
-        .current_dir(clone.path())
-        .args(["bundle", "list-heads", bundle_path.to_str().unwrap()])
-        .output()?;
-    assert!(
-        String::from_utf8_lossy(&out.stdout).contains(&new_tip),
-        "{}",
-        String::from_utf8_lossy(&out.stdout)
-    );
-
     // Protocol v0 is refused with a readable explanation (stock git cannot
     // read a remote-served base).
     std::fs::write(src.join("after2.txt"), "second\n")?;
@@ -1336,103 +1233,6 @@ async fn fetch_from_front_that_serves_the_base_remotely() -> TestResult {
         .output()?;
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("protocol v2"));
-    Ok(())
-}
-
-/// `bundles.require`: on a listed repository a fetch with zero haves (a clone
-/// that skipped bundle-uri) is refused with the exact fix — v2 (band 3 when the
-/// client accepts sideband, pkt ERR otherwise) and v0 — while clones through
-/// bundle-uri and ordinary fetches with haves proceed.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn bundles_require_refuses_zero_have_fetches_with_the_fix() -> TestResult {
-    let server = Server::start_with_tweak(|c| c.bundles.require = vec!["t/*".into()]).await?;
-    server.put_repo("t", "req").await?;
-    let src = TestRepo::synthetic(3, 2)?;
-    git_in(
-        &src,
-        &["remote", "add", "origin", &server.repo_url("t", "req")],
-    )?;
-    git_in(&src, &["push", "-q", "origin", "main"])?;
-    server.build_bundle("t", "req", "weekly").await?;
-    let url = server.repo_url("t", "req");
-
-    for proto in ["2", "0"] {
-        let dir = tempfile::tempdir()?;
-        let out = std::process::Command::new("git")
-            .args([
-                "-c",
-                &format!("protocol.version={proto}"),
-                "-c",
-                "transfer.bundleURI=false",
-                "clone",
-                &url,
-                dir.path().to_str().unwrap(),
-            ])
-            .output()?;
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            !out.status.success(),
-            "v{proto} clone without bundle-uri must be refused:\n{stderr}"
-        );
-        assert!(
-            stderr.contains("transfer.bundleURI true"),
-            "v{proto} fix missing:\n{stderr}"
-        );
-        assert!(stderr.contains("served from static bundles"), "{stderr}");
-    }
-
-    // D16: bounded zero-have fetches (CI's shallow / filtered clones) are served.
-    for args in [
-        vec!["--depth", "1"],
-        vec!["--filter=blob:none"],
-        vec!["--depth", "1", "--filter=blob:none", "--single-branch"],
-    ] {
-        let d = tempfile::tempdir()?;
-        let mut cmd = vec!["-c", "transfer.bundleURI=false", "clone", "-q"];
-        cmd.extend(args.iter().copied());
-        cmd.push(&url);
-        cmd.push(d.path().to_str().unwrap());
-        let out = std::process::Command::new("git").args(&cmd).output()?;
-        assert!(
-            out.status.success(),
-            "{args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        assert_eq!(
-            git_in(d.path(), &["rev-parse", "HEAD"])?.trim(),
-            git_in(&src, &["rev-parse", "main"])?.trim()
-        );
-    }
-
-    // Through bundle-uri: history from the bundle, the server fills the gap.
-    let dir = tempfile::tempdir()?;
-    let out = std::process::Command::new("git")
-        .args([
-            "-c",
-            "transfer.bundleURI=true",
-            "clone",
-            &url,
-            dir.path().to_str().unwrap(),
-        ])
-        .output()?;
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let head = git_in(&src, &["rev-parse", "main"])?;
-    assert_eq!(git_in(dir.path(), &["rev-parse", "HEAD"])?, head);
-
-    // A later fetch (haves present) works.
-    std::fs::write(src.join("more.txt"), "more\n")?;
-    git_in(&src, &["add", "more.txt"])?;
-    git_in(&src, &["commit", "-q", "-m", "more"])?;
-    git_in(&src, &["push", "-q", "origin", "main"])?;
-    git_in(dir.path(), &["fetch", "-q", "origin"])?;
-    assert_eq!(
-        git_in(dir.path(), &["rev-parse", "origin/main"])?,
-        git_in(&src, &["rev-parse", "main"])?
-    );
     Ok(())
 }
 
@@ -1457,8 +1257,6 @@ async fn max_wants_refuses_the_blobless_checkout_storm_with_the_fix() -> TestRes
     let dir = tempfile::tempdir()?;
     let out = std::process::Command::new("git")
         .args([
-            "-c",
-            "transfer.bundleURI=false",
             "clone",
             "--filter=blob:none",
             "--progress",
@@ -1476,7 +1274,7 @@ async fn max_wants_refuses_the_blobless_checkout_storm_with_the_fix() -> TestRes
         "{stderr}"
     );
     assert!(
-        stderr.contains("--filter=blob:none --sparse --bundle-uri="),
+        stderr.contains("--filter=blob:none --sparse"),
         "the fix is in the error:\n{stderr}"
     );
     // The initial (commit/tree) fetch narrated the heads-up on band 2 before anything went wrong.
@@ -1493,8 +1291,6 @@ async fn max_wants_refuses_the_blobless_checkout_storm_with_the_fix() -> TestRes
     let dir = tempfile::tempdir()?;
     let out = std::process::Command::new("git")
         .args([
-            "-c",
-            "transfer.bundleURI=false",
             "clone",
             "-q",
             "--filter=blob:none",
@@ -1520,120 +1316,6 @@ async fn max_wants_refuses_the_blobless_checkout_storm_with_the_fix() -> TestRes
         .to_string();
     git_in(dir.path(), &["checkout", "-q", "HEAD", "--", &one])?;
     assert!(dir.path().join(&one).exists());
-    Ok(())
-}
-
-/// D17 amendment: a principal that fetched the bundle list within the hour
-/// TRIED bundle-uri (its zero-have fetch is a bundle download that failed —
-/// git never retries one) and gets ONE upload-pack full clone per 6 h, with a
-/// loud band-2 warning; the next one is refused with the truthful message; a
-/// principal that never fetched the list is refused as before.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn bundles_require_allows_one_upload_pack_fallback_after_a_failed_bundle_attempt()
--> TestResult {
-    let server = Server::start_with_tweak(|c| {
-        c.bundles.require = vec!["t/*".into()];
-        c.server.auth.mode = walgit_config::AuthMode::Token;
-        c.server.auth.anonymous_read = false;
-        c.server.auth.tokens = vec![
-            walgit_config::StaticToken {
-                principal: "dev@example.com".into(),
-                token: "dev".into(),
-                token_env: None,
-                write: true,
-                admin: false,
-            },
-            walgit_config::StaticToken {
-                principal: "other@example.com".into(),
-                token: "other".into(),
-                token_env: None,
-                write: true,
-                admin: false,
-            },
-        ];
-    })
-    .await?;
-    let r = reqwest::Client::new()
-        .put(format!("{}/t/fb.git", server.base_url))
-        .header("Authorization", "Bearer dev")
-        .send()
-        .await?;
-    assert!(r.status().is_success(), "{}", r.status());
-    let src = tempfile::tempdir()?;
-    git(&["init", "-q", "-b", "main", "."], src.path())?;
-    git(
-        &[
-            "-c",
-            "user.email=t@t",
-            "-c",
-            "user.name=T",
-            "commit",
-            "-q",
-            "--allow-empty",
-            "-m",
-            "one",
-        ],
-        src.path(),
-    )?;
-    let url = server.repo_url("t", "fb");
-    git(
-        &[
-            "-c",
-            "http.extraHeader=Authorization: Bearer dev",
-            "push",
-            "-q",
-            &url,
-            "main",
-        ],
-        src.path(),
-    )?;
-    let clone = |token: &str| {
-        let d = tempfile::tempdir().unwrap();
-        let out = std::process::Command::new("git")
-            .args([
-                "-c",
-                &format!("http.extraHeader=Authorization: Bearer {token}"),
-                "-c",
-                "transfer.bundleURI=false",
-                "clone",
-                "--progress",
-                &url,
-                d.path().to_str().unwrap(),
-            ])
-            .output()
-            .unwrap();
-        (
-            out.status.success(),
-            String::from_utf8_lossy(&out.stderr).to_string(),
-        )
-    };
-    // Never fetched the list → refused.
-    let (ok, err) = clone("dev");
-    assert!(!ok && err.contains("served from static bundles"), "{err}");
-    // "Tried" bundle-uri: fetched the list.
-    let list = reqwest::Client::new()
-        .get(format!("{}/t/fb.git/bundles/list", server.base_url))
-        .header("Authorization", "Bearer dev")
-        .send()
-        .await?;
-    assert!(
-        list.status() == 200 || list.status() == 404,
-        "{}",
-        list.status()
-    );
-    // One fallback, loudly.
-    let (ok, err) = clone("dev");
-    assert!(ok, "fallback clone must succeed:\n{err}");
-    assert!(
-        err.contains("WARNING") && err.contains("upload-pack ONCE"),
-        "{err}"
-    );
-    // The second within 6 h: refused, and the message says so.
-    let (ok, err) = clone("dev");
-    assert!(!ok && err.contains("you may have used it"), "{err}");
-    // Another principal that never tried: refused.
-    let (ok, err) = clone("other");
-    assert!(!ok && err.contains("served from static bundles"), "{err}");
     Ok(())
 }
 
@@ -2052,81 +1734,6 @@ async fn blocking_work_in_the_install_path_does_not_stall_requests() -> TestResu
     Ok(())
 }
 
-/// Signed bundle URLs that cannot be produced because store signing is
-/// unavailable or denied must fall back to proxy URIs — the
-/// static list, the v2 `bundle-uri` command and a clone through bundle-uri all
-/// work — and the fetch narrates each advertised bundle by relative path.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn signed_url_failure_falls_back_to_proxy_uris_and_bundles_are_narrated() -> TestResult {
-    let server = Server::start_with_store_and_tweak(
-        {
-            let mut s = walgit_store::memory::MemoryStore::new();
-            s.signing_fails = true;
-            std::sync::Arc::new(s)
-        },
-        |c| c.bundles.signed_url_for = vec!["t/*".into()],
-    )
-    .await?;
-    server.put_repo("t", "sig").await?;
-    let src = TestRepo::synthetic(3, 2)?;
-    git_in(
-        &src,
-        &["remote", "add", "origin", &server.repo_url("t", "sig")],
-    )?;
-    git_in(&src, &["push", "-q", "origin", "main"])?;
-    server.build_bundle("t", "sig", "weekly").await?;
-
-    // Static list: 200 with proxy URIs, never a 500.
-    let list = server.get_text("/t/sig.git/bundles/list", &[]).await?;
-    assert!(
-        list.contains(&format!("uri = {}/t/sig/bundles/weekly/", server.base_url)),
-        "{list}"
-    );
-
-    // Clone through bundle-uri (v2 command + fetch of the bundle), narrated.
-    let dir = tempfile::tempdir()?;
-    let out = std::process::Command::new("git")
-        .args([
-            "-c",
-            "protocol.version=2",
-            "-c",
-            "transfer.bundleURI=true",
-            "clone",
-            "--progress",
-            &server.repo_url("t", "sig"),
-            dir.path().to_str().unwrap(),
-        ])
-        .output()?;
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "{stderr}");
-    assert_eq!(
-        git_in(dir.path(), &["rev-parse", "HEAD"])?,
-        git_in(&src, &["rev-parse", "main"])?
-    );
-    // A fetch with work narrates the bundles from the client's point of view: the list's shape per
-    // strategy, and which bundles THIS git applied (its haves are their tips) with their bytes.
-    std::fs::write(src.join("n.txt"), "n\n")?;
-    git_in(&src, &["add", "n.txt"])?;
-    git_in(&src, &["commit", "-q", "-m", "n"])?;
-    git_in(&src, &["push", "-q", "origin", "main"])?;
-    let out = std::process::Command::new("git")
-        .args(["-c", "protocol.version=2", "fetch", "--progress", "origin"])
-        .current_dir(dir.path())
-        .output()?;
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "{stderr}");
-    assert!(
-        stderr.contains("* bundle-uri: 1 listed — 1 weekly ("),
-        "list shape missing:\n{stderr}"
-    );
-    assert!(
-        stderr.contains("* bundle-uri: your git applied 1 bundle(s) = ")
-            && stderr.contains("(weekly) — history as of "),
-        "applied-bundles line missing:\n{stderr}"
-    );
-    Ok(())
-}
-
 /// D24: per-repo settings over HTTP — PUT validates (400 with the reason,
 /// nothing published), GET returns the document + revision, `effective` is
 /// the host config ⊕ settings, a sibling instance sees it on its next refs
@@ -2154,16 +1761,16 @@ async fn repo_settings_api_roundtrip() -> TestResult {
     // Valid.
     let r = c
         .put(url(&a, "?message=tiny+repo"))
-        .body("[bundles]\nmin_commits = 2\n")
+        .body("[compaction]\ntrigger_packs = 2\n")
         .send()
         .await?;
     assert_eq!(r.status(), 200, "{}", r.text().await?);
     let r: serde_json::Value = c.get(url(&a, "")).send().await?.json().await?;
     assert_eq!(r["revision"], 1);
     assert_eq!(r["message"], "tiny repo");
-    assert!(r["toml"].as_str().unwrap().contains("min_commits = 2"));
+    assert!(r["toml"].as_str().unwrap().contains("trigger_packs = 2"));
     let eff = c.get(url(&a, "/effective")).send().await?.text().await?;
-    assert!(eff.contains("min_commits = 2"), "{eff}");
+    assert!(eff.contains("trigger_packs = 2"), "{eff}");
     assert!(!eff.contains("session_secret"), "{eff}");
     assert!(!eff.contains("[server]"), "{eff}");
 
@@ -2177,8 +1784,8 @@ async fn repo_settings_api_roundtrip() -> TestResult {
             .open(&id)
             .await?
             .effective_config()
-            .bundles
-            .min_commits,
+            .compaction
+            .trigger_packs,
         2
     );
 
@@ -2208,8 +1815,8 @@ async fn repo_settings_api_roundtrip() -> TestResult {
     Ok(())
 }
 
-/// Settings tab backend: describe (strategies with next fire + human schedule,
-/// fields with sources), validate (preview, errors), policy validate + dry-run
+/// Settings tab backend: describe fields with sources, validate (preview, errors),
+/// and policy validate + dry-run
 /// against the last pushes.
 // multi_thread: the synchronous `git push` below must not block the runtime
 // the server runs on (a current-thread test hangs forever on the first push).
@@ -2232,18 +1839,6 @@ async fn settings_describe_validate_and_policy_dry_run() -> TestResult {
         .await?
         .json()
         .await?;
-    let strategies = d["strategies"].as_array().unwrap();
-    assert!(!strategies.is_empty());
-    let weekly = strategies.iter().find(|x| x["name"] == "weekly").unwrap();
-    assert_eq!(weekly["kind"], "full");
-    assert!(
-        weekly["schedule_human"]
-            .as_str()
-            .unwrap()
-            .contains("Sunday"),
-        "{weekly}"
-    );
-    assert!(weekly["next"].is_string());
     assert!(
         d["fields"]
             .as_array()
@@ -2256,7 +1851,7 @@ async fn settings_describe_validate_and_policy_dry_run() -> TestResult {
     // Validate: preview flips the touched field's source; errors come back as a list.
     let v: serde_json::Value = c
         .post(format!("{base}/settings/validate"))
-        .body("[bundles]\nmin_commits = 4\n")
+        .body("[compaction]\ntrigger_packs = 4\n")
         .send()
         .await?
         .json()
@@ -2266,7 +1861,7 @@ async fn settings_describe_validate_and_policy_dry_run() -> TestResult {
         .as_array()
         .unwrap()
         .iter()
-        .find(|f| f["key"] == "bundles.min_commits")
+        .find(|f| f["key"] == "compaction.trigger_packs")
         .unwrap();
     assert_eq!(f["value"], 4);
     assert_eq!(f["source"], "setting");
@@ -2496,203 +2091,6 @@ async fn http_inflight_gauge_covers_streamed_bodies_and_returns_to_zero() -> Tes
     Ok(())
 }
 
-/// The north star's second half — fast catch-up through bundles — needs `fetch.bundleURI` on the
-/// clone: git 2.51 records only `fetch.bundleCreationToken` for an advertised bundle-uri clone, so a
-/// later `git fetch` skips bundles entirely. Every recipe we emit passes `-c fetch.bundleURI=<list>`
-/// (`setup::Recipes`). This clones the way the recipe does, pushes, cuts an incremental bundle, and
-/// asserts the fetch took it: trace2 shows the list + bundle downloads, the upload-pack remainder is
-/// tiny, and `fetch.bundleCreationToken` advanced.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn fetch_after_the_recipe_clone_uses_the_bundles() -> TestResult {
-    let server = Server::start().await?;
-    server.put_repo("t", "catchup").await?;
-    let src = TestRepo::synthetic(4, 3)?;
-    git_in(&src, &["branch", "-M", "main"])?;
-    git_in(
-        &src,
-        &["remote", "add", "origin", &server.repo_url("t", "catchup")],
-    )?;
-    git_in(&src, &["push", "-q", "origin", "main"])?;
-    server.build_bundle("t", "catchup", "weekly").await?;
-
-    // The recipe, verbatim from /services/setup.json (the UI's single source of truth).
-    let setup: serde_json::Value = reqwest::Client::new()
-        .get(format!(
-            "{}/services/setup.json?repo=t/catchup",
-            server.base_url
-        ))
-        .header("Authorization", "Bearer dev")
-        .send()
-        .await?
-        .json()
-        .await?;
-    let plain = setup["plain_clone"].as_str().expect("plain_clone");
-    // Fetches record the catch-up list (no fulls): `bundles/catchup`.
-    let list = format!("{}/bundles/catchup", server.repo_url("t", "catchup"));
-    assert_eq!(
-        plain,
-        format!(
-            "git clone -c fetch.bundleURI={list} {}",
-            server.repo_url("t", "catchup")
-        )
-    );
-    let catchup_text = server
-        .get_text("/t/catchup.git/bundles/catchup", &[])
-        .await?;
-    assert!(
-        !catchup_text.contains("weekly-"),
-        "the catch-up list carries no fulls:\n{catchup_text}"
-    );
-    let clone_text = server.get_text("/t/catchup.git/bundles/list", &[]).await?;
-    assert!(
-        clone_text.contains("weekly-"),
-        "the clone list does:\n{clone_text}"
-    );
-    let clone_dir = tempfile::tempdir()?;
-    let mut args: Vec<&str> = plain.split(' ').skip(1).collect(); // drop the leading "git"
-    args.insert(0, "transfer.bundleURI=true");
-    args.insert(0, "-c");
-    let dir_str = clone_dir.path().to_str().unwrap();
-    args.push(dir_str);
-    git(&args, clone_dir.path().parent().unwrap())?;
-    assert_eq!(
-        git_in(clone_dir.path(), &["config", "fetch.bundleURI"])?.trim(),
-        list,
-        "the clone recorded the list"
-    );
-    let token_before: u64 = git_in(clone_dir.path(), &["config", "fetch.bundleCreationToken"])?
-        .trim()
-        .parse()?;
-
-    // New history on the server, folded into a new incremental bundle (the maintainer's daily slot).
-    for i in 0..3 {
-        std::fs::write(src.join(format!("catchup-{i}.txt")), format!("{i}\n"))?;
-        git_in(&src, &["add", "."])?;
-        git_in(&src, &["commit", "-q", "-m", &format!("catchup {i}")])?;
-    }
-    git_in(&src, &["push", "-q", "origin", "main"])?;
-    server.build_bundle("t", "catchup", "daily").await?;
-
-    // The fetch, traced (GIT_TRACE2_EVENT needs a path git can open; a file it appends to):
-    // the bundle list + the new bundle are downloaded (the bundle is unbundled through
-    // `index-pack <file>`, never `--stdin`) and the creationToken moves to the new slot.
-    let trace_dir = tempfile::tempdir()?;
-    let trace_path = trace_dir.path().join("trace.jsonl");
-    let out = std::process::Command::new("git")
-        .current_dir(clone_dir.path())
-        .env("GIT_TRACE2_EVENT", &trace_path)
-        .args(["fetch", "origin"])
-        .output()?;
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert_eq!(
-        git_in(clone_dir.path(), &["rev-parse", "origin/main"])?,
-        git_in(&src, &["rev-parse", "main"])?
-    );
-    let events = std::fs::read_to_string(&trace_path).unwrap_or_default();
-    // git downloads the list and each newer bundle with `git-remote-https <url>` children (the bundle is
-    // unbundled in-process), then negotiates the remainder with upload-pack.
-    let downloads: Vec<&str> = events
-        .lines()
-        .filter(|l| l.contains("\"child_start\"") && l.contains("git-remote-https\",\"http"))
-        .collect();
-    let list_downloads = downloads
-        .iter()
-        .filter(|l| l.contains("/bundles/catchup\""))
-        .count();
-    let bundle_downloads = downloads
-        .iter()
-        .filter(|l| l.contains("/bundles/daily/"))
-        .count();
-    assert_eq!(
-        list_downloads,
-        1,
-        "the fetch must read the catch-up list once:\n{}",
-        downloads.join("\n")
-    );
-    assert_eq!(
-        bundle_downloads,
-        1,
-        "the fetch must download the one newer (daily) bundle, never the weekly:\n{}",
-        downloads.join("\n")
-    );
-    assert!(
-        !downloads.iter().any(|l| l.contains("/bundles/weekly/")),
-        "{}",
-        downloads.join("\n")
-    );
-    let token_after: u64 = git_in(clone_dir.path(), &["config", "fetch.bundleCreationToken"])?
-        .trim()
-        .parse()?;
-    assert!(
-        token_after > token_before,
-        "creationToken must advance ({token_before} → {token_after})"
-    );
-    eprintln!(
-        "fetch: creationToken {token_before} → {token_after}; list downloads {list_downloads}, bundle downloads {bundle_downloads}"
-    );
-
-    // The weekly rollover: more history, a NEW full, then a daily cut after it. A stale client's fetch
-    // must walk daily → daily and never download the new full (on a large repository: 32 GB for every developer's
-    // first fetch after Sunday, measured on the rig 2026-08-22). The catch-up list has no fulls, and
-    // the first daily after the weekly chains on the previous daily (same tips as the weekly).
-    for i in 3..6 {
-        std::fs::write(src.join(format!("catchup-{i}.txt")), format!("{i}\n"))?;
-        git_in(&src, &["add", "."])?;
-        git_in(&src, &["commit", "-q", "-m", &format!("catchup {i}")])?;
-    }
-    git_in(&src, &["push", "-q", "origin", "main"])?;
-    // A daily at the weekly's instant and the weekly itself (Sunday 23:00 on the real calendar: the
-    // test cuts both "now" with slot 0, tokens increase with the clock).
-    server.build_bundle("t", "catchup", "daily").await?;
-    server.build_bundle("t", "catchup", "weekly").await?;
-    std::fs::write(src.join("monday.txt"), "m\n")?;
-    git_in(&src, &["add", "."])?;
-    git_in(&src, &["commit", "-q", "-m", "monday"])?;
-    git_in(&src, &["push", "-q", "origin", "main"])?;
-    server.build_bundle("t", "catchup", "daily").await?;
-    let trace_path = trace_dir.path().join("trace2.jsonl");
-    let out = std::process::Command::new("git")
-        .current_dir(clone_dir.path())
-        .env("GIT_TRACE2_EVENT", &trace_path)
-        .args(["fetch", "origin"])
-        .output()?;
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert_eq!(
-        git_in(clone_dir.path(), &["rev-parse", "origin/main"])?,
-        git_in(&src, &["rev-parse", "main"])?
-    );
-    let events = std::fs::read_to_string(&trace_path).unwrap_or_default();
-    let downloads: Vec<&str> = events
-        .lines()
-        .filter(|l| l.contains("\"child_start\"") && l.contains("git-remote-https\",\"http"))
-        .collect();
-    assert!(
-        !downloads.iter().any(|l| l.contains("/bundles/weekly/")),
-        "a fetch across the weekly rollover must not download the new full:\n{}",
-        downloads.join("\n")
-    );
-    let dailies = downloads
-        .iter()
-        .filter(|l| l.contains("/bundles/daily/"))
-        .count();
-    assert_eq!(
-        dailies,
-        2,
-        "exactly the two dailies since the last fetch:\n{}",
-        downloads.join("\n")
-    );
-    assert!(git_in(clone_dir.path(), &["fsck", "--no-dangling"]).is_ok());
-    Ok(())
-}
-
 /// `/services/public/*` is the one open lane: the installer is fetched before
 /// a user has any credential. Data-free only; everything else under the prefix is 404; nothing else
 /// on the host opened up; the old installer path is gone (banner).
@@ -2726,7 +2124,7 @@ async fn public_lane_serves_only_the_installer_without_auth() -> TestResult {
         body.contains("git config --global --add \"credential.https://$HOST.helper\" \"$HELPER\""),
         "{body}"
     );
-    assert!(body.contains("-c fetch.bundleURI="), "{body}");
+    assert!(!body.contains("fetch.bundleURI"), "{body}");
     for (path, want) in [
         ("/services/public/nothing-else", 404),
         ("/services/public/", 404),
@@ -2852,8 +2250,6 @@ async fn stale_cached_credential_is_erased_by_the_401_and_replaced_on_the_next_c
         let dir = tempfile::tempdir().unwrap();
         std::process::Command::new("git")
             .args([
-                "-c",
-                "transfer.bundleURI=false",
                 "clone",
                 "-q",
                 &server.repo_url("t", "stale"),
@@ -2964,6 +2360,7 @@ async fn reads_after_an_acknowledged_push_never_show_the_previous_tip() -> TestR
         assert!(!base.is_empty());
         // 6 contenders from the same base, each with its own commit.
         let mut handles = Vec::new();
+        let start_pushes = std::sync::Arc::new(std::sync::Barrier::new(7));
         for i in 0..6 {
             let d = tempfile::tempdir()?;
             git(
@@ -2979,10 +2376,12 @@ async fn reads_after_an_acknowledged_push_never_show_the_previous_tip() -> TestR
             let sha = git_in(d.path(), &["rev-parse", "HEAD"])?.trim().to_string();
             let url2 = url.clone();
             let cwd = d.path().to_path_buf();
+            let start = start_pushes.clone();
             handles.push((
                 d,
                 sha,
                 std::thread::spawn(move || {
+                    start.wait();
                     // true when this push won
                     let o = std::process::Command::new("git")
                         .current_dir(&cwd)
@@ -3017,12 +2416,17 @@ async fn reads_after_an_acknowledged_push_never_show_the_previous_tip() -> TestR
             }
             seen
         });
+        // Every clone and commit exists before any contender may publish.
+        start_pushes.wait();
         let mut winner = None;
+        let mut winners = 0;
         for (_d, sha, h) in handles {
             if h.join().unwrap() {
+                winners += 1;
                 winner = Some(sha);
             }
         }
+        assert_eq!(winners, 1, "exactly one same-base push wins each round");
         let winner = winner.expect("exactly one push wins each round");
         // Read-your-writes: the first read after the last push returned must be the winner, and so
         // must every read after it.

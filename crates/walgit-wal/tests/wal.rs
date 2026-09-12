@@ -2195,8 +2195,8 @@ async fn test_repo_settings_publish_and_effective_config() {
     let handle = registry.create(&id, ObjectFormat::Sha1).await.unwrap();
     assert!(handle.settings().is_none());
     assert_eq!(
-        handle.effective_config().bundles.min_commits,
-        handle.effective_config().bundles.min_commits
+        handle.effective_config().compaction.factor,
+        make_config(cache.path(), 0).compaction.factor
     );
 
     // Rejected: forbidden section; unknown key.
@@ -2215,12 +2215,12 @@ async fn test_repo_settings_publish_and_effective_config() {
 
     // Accepted.
     let rev = handle
-        .publish_settings("[bundles]\nmin_commits = 3\n", "alice", "small repo")
+        .publish_settings("[compaction]\nfactor = 3\n", "alice", "small repo")
         .await
         .unwrap();
     assert_eq!(rev, 1);
     assert_eq!(handle.manifest().head_seq, 1);
-    assert_eq!(handle.effective_config().bundles.min_commits, 3);
+    assert_eq!(handle.effective_config().compaction.factor, 3);
     let log = handle.read_log(1, None).await.unwrap();
     assert_eq!(log[0].kind(), walgit_proto::v1::EntryKind::Settings);
     assert_eq!(log[0].settings.as_ref().unwrap().author, "alice");
@@ -2231,25 +2231,92 @@ async fn test_repo_settings_publish_and_effective_config() {
     let h2 = registry2.open(&id).await.unwrap();
     h2.sync_refs().await.unwrap();
     assert_eq!(h2.settings().unwrap().revision, 1);
-    assert_eq!(h2.effective_config().bundles.min_commits, 3);
+    assert_eq!(h2.effective_config().compaction.factor, 3);
 
     // Second publish bumps the revision; clearing restores the host config.
     assert_eq!(
         handle
-            .publish_settings("[bundles]\nmin_commits = 9\n", "alice", "")
+            .publish_settings("[compaction]\nfactor = 9\n", "alice", "")
             .await
             .unwrap(),
         2
     );
-    assert_eq!(handle.effective_config().bundles.min_commits, 9);
+    assert_eq!(handle.effective_config().compaction.factor, 9);
     assert_eq!(
         handle.publish_settings("", "alice", "clear").await.unwrap(),
         3
     );
     assert_eq!(
-        handle.effective_config().bundles.min_commits,
-        make_config(cache.path(), 0).bundles.min_commits
+        handle.effective_config().compaction.factor,
+        make_config(cache.path(), 0).compaction.factor
     );
+}
+
+/// Old bucket settings keep their supported overrides and original audit record.
+#[tokio::test]
+async fn test_repo_settings_bundle_removal_replays_without_losing_overrides() {
+    use prost::Message;
+    use walgit_store::ObjectStoreExt;
+    let cache = tempfile::tempdir().unwrap();
+    let store = MemoryStore::shared();
+    let registry = Registry::new(store.clone(), Arc::new(make_config(cache.path(), 0)));
+    let id = repo_id("test", "saved-settings");
+    let handle = registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+    let supported = "[compaction]\nfactor = 3\n[upstream]\ngit = \"https://git.example.com/acme/source.git\"\nfollow = [\"refs/heads/release\"]\n";
+    handle
+        .publish_settings(supported, "alice", "preserve scope")
+        .await
+        .unwrap();
+    let saved = format!("# Historical configuration\n[bundles]\nenabled = false\n{supported}");
+
+    // Encode the manifest and log as an older writer did. New writes cannot
+    // introduce this document, so seed persisted bytes rather than a shim API.
+    let mkey = format!("{}{}", id.store_prefix(), walgit_proto::keys::MANIFEST);
+    let (_, bytes) = store.get_bytes(&mkey).await.unwrap().unwrap();
+    let mut manifest = walgit_proto::v1::Manifest::decode(bytes.as_ref()).unwrap();
+    manifest.settings.as_mut().unwrap().toml = saved.clone();
+    let segment = &mut manifest.log_segments[0];
+    let lkey = format!("{}{}", id.store_prefix(), segment.key);
+    let (_, bytes) = store.get_bytes(&lkey).await.unwrap().unwrap();
+    let (mut entries, _) = walgit_proto::frame::decode_entries(&bytes).unwrap();
+    entries[0].settings.as_mut().unwrap().toml = saved.clone();
+    let log_bytes = walgit_proto::frame::encode_entries(entries.iter());
+    segment.size = log_bytes.len() as u64;
+    store
+        .put_bytes(&lkey, log_bytes, walgit_store::PutMode::Overwrite)
+        .await
+        .unwrap();
+    store
+        .put_bytes(
+            &mkey,
+            manifest.encode_to_vec(),
+            walgit_store::PutMode::Overwrite,
+        )
+        .await
+        .unwrap();
+
+    let cache2 = tempfile::tempdir().unwrap();
+    let reader = Registry::new(store.clone(), Arc::new(make_config(cache2.path(), 0)));
+    let replayed = reader.open(&id).await.unwrap();
+    replayed.sync_refs().await.unwrap();
+    let effective = replayed.effective_config();
+    assert_eq!(effective.compaction.factor, 3);
+    assert_eq!(
+        effective.upstream.git.as_deref(),
+        Some("https://git.example.com/acme/source.git")
+    );
+    assert_eq!(effective.upstream.follow, ["refs/heads/release"]);
+    assert_eq!(replayed.settings().unwrap().toml, saved);
+    let log = replayed.read_log(1, None).await.unwrap();
+    assert_eq!(log[0].settings.as_ref().unwrap().toml, saved);
+    assert!(
+        replayed
+            .publish_settings(&saved, "bob", "new write")
+            .await
+            .is_err()
+    );
+    assert_eq!(replayed.settings().unwrap().revision, 1);
+    assert_eq!(replayed.manifest().head_seq, 1);
 }
 
 /// D22 provenance on the checkpoint: `first_state_at` = the earliest entry

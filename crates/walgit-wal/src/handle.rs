@@ -1031,7 +1031,9 @@ impl RepoHandle {
     }
 
     /// D24: effective configuration = host config ⊕ this repository's
-    /// settings, cached per settings revision. Settings that no longer parse
+    /// settings, cached per settings revision. Saved pre-removal bundle settings
+    /// are omitted from this derived view only; the durable document is unchanged.
+    /// Settings that no longer parse
     /// against this build fall back to the host config with a warning
     /// (never a failure on a read path).
     pub fn effective_config(&self) -> Arc<walgit_config::Config> {
@@ -1046,7 +1048,23 @@ impl RepoHandle {
             return c.clone();
         }
         let toml = settings.as_ref().map_or("", |s| s.toml.as_str());
-        let cfg = match self.cfg.with_settings(toml) {
+        // Bucket-data compatibility, deliberately absent from Config::with_settings:
+        // host files and new settings writes must reject the removed section.
+        let migrated = (toml.len() <= walgit_config::SETTINGS_MAX_BYTES)
+            .then(|| toml.parse::<toml::Table>().ok())
+            .flatten()
+            .and_then(|mut doc| {
+                if !matches!(doc.get("bundles"), Some(toml::Value::Table(_))) {
+                    return None;
+                }
+                doc.remove("bundles");
+                Some(doc.to_string())
+            });
+        if migrated.is_some() {
+            tracing::warn!(repo = %self.id, revision = rev,
+                "migrating saved repo settings for bundle removal: ignoring [bundles] in effective config; durable settings and history are unchanged");
+        }
+        let cfg = match self.cfg.with_settings(migrated.as_deref().unwrap_or(toml)) {
             Ok(c) => Arc::new(c),
             Err(e) => {
                 tracing::warn!(repo = %self.id, revision = rev, error = %e, "repo settings do not apply to this build; using the host config");

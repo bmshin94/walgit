@@ -177,7 +177,7 @@ export interface OpSpec {
 }
 export interface OpRecord {
   id: string;
-  /** The task kind (fsck, compact, bundle, checkpoint, materialize, …) — the wire field is `kind`. */
+  /** The task kind (fsck, compact, checkpoint, materialize, …) — the wire field is `kind`. */
   kind: string;
   repo: string;
   hostname: string;
@@ -199,7 +199,7 @@ export type Overview = Record<string, unknown> & {
   clone_url: string;
   hostname: string;
   health: { status: "ok" | "degraded" | "error"; issues: string[]; deep: string };
-  ops: { available: OpSpec[]; recent: OpRecord[]; bundle_strategies: string[] };
+  ops: { available: OpSpec[]; recent: OpRecord[] };
 };
 /** One `/policy` document (docs/POLICY.md). */
 export type Policy = Record<string, unknown>;
@@ -714,7 +714,7 @@ export class RepoClient {
       }),
   };
 
-  /** D24: WAL-backed TOML overrides of [bundles], [maintenance], [compaction] and [upstream]. */
+  /** D24: WAL-backed TOML overrides of [maintenance], [compaction] and [upstream]. */
   readonly settings = {
     /** The settings document (`revision: 0` = none). */
     get: (opts?: CallOptions) => this.client.json<RepoSettings>(`${this.p}/settings`, opts),
@@ -754,21 +754,6 @@ export interface SettingsHistory {
   min_seq: number;
   entries: { seq: number; revision: number; author: string; message: string; at: string | null; toml: string }[];
 }
-export interface StrategyInfo {
-  name: string;
-  kind: "full" | "incremental";
-  base: string | null;
-  schedule: string;
-  schedule_human: string;
-  next: string | null;
-  keep: number;
-  backfill_max: number;
-  min_commits: number;
-  refs: string[];
-  /** Incrementals: cut on this strategy's previous bundle (chained) instead of the base's newest. */
-  chain: boolean;
-  filter: string | null;
-}
 export interface SettingsField {
   key: string;
   value: unknown;
@@ -779,8 +764,6 @@ export interface SettingsDescribe {
   repo: string;
   settings: RepoSettings | { revision: 0; toml: "" };
   sections: string[];
-  strategies: StrategyInfo[];
-  bundles: { enabled: boolean; min_commits: number; main_only: boolean };
   maintenance: {
     checkpoints: boolean;
     interval_secs: number;

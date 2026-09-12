@@ -133,7 +133,7 @@ fn parse_query(query: &str, key: &str) -> Option<String> {
 /// Build the protocol v2 capability advertisement for upload-pack.
 async fn v2_capability_advert(
     st: &AppState,
-    id: &walgit_git::RepoId,
+    _id: &walgit_git::RepoId,
     handle: &Arc<walgit_wal::RepoHandle>,
     buf: &mut Vec<u8>,
 ) -> Result<(), ApiError> {
@@ -147,8 +147,7 @@ async fn v2_capability_advert(
     }
     // With sideband-all every response line is sideband-framed, which lets us
     // narrate what the server is doing (band 2 → "remote: * …") *before* the
-    // packfile section: auth, WAL sync, materialization progress, bundle-uri
-    // facts. Both engines frame their sections that way.
+    // packfile section: auth, WAL sync, materialization progress. Both engines frame their sections that way.
     fetch.push_str(" sideband-all");
     pktline::encode_text(buf, &format!("{fetch}\n"));
     pktline::encode_text(buf, "server-option\n");
@@ -157,11 +156,6 @@ async fn v2_capability_advert(
         walgit_git::ObjectFormat::Sha256 => "sha256",
     };
     pktline::encode_text(buf, &format!("object-format={fmt}\n"));
-    if st.cfg.bundles.advertise
-        && let Ok(Some(_list)) = st.bundles.list(id).await
-    {
-        pktline::encode_text(buf, "bundle-uri\n");
-    }
     pktline::encode_flush(buf);
     Ok(())
 }
@@ -271,58 +265,11 @@ async fn upload_pack_v2(
                     git_err_response("git-upload-pack", &msg)
                 });
             }
-            // Policy: listed repos hand clone bytes out as static bundles. A
-            // fetch with zero haves is a clone that skipped bundle-uri —
-            // refuse it with the fix before any sync or pack work.
-            // D17: only an *unbounded* zero-have fetch (no deepen, no filter)
-            // is refused — that is a full clone and belongs to bundle-uri.
-            // `--depth`/`--filter` zero-have fetches are the CI workload and
-            // go to upload-pack.
-            let mut fallback_warning: Option<String> = None;
-            if req.haves.is_empty()
-                && req.deepen.is_none()
-                && req.deepen_since.is_none()
-                && req.deepen_not.is_empty()
-                && req.filter.is_none()
-                && st.cfg.bundles_required(route.id.owner(), route.id.name())
-            {
-                // D17 amendment (2026-08-21): a principal that fetched the bundle
-                // list within the hour TRIED bundle-uri — its zero-have fetch is a
-                // bundle download that failed (git never retries one). Let that
-                // clone succeed through upload-pack, once per 6 h, loudly.
-                if let Some(who) = bundle_fallback_allowed(st, headers, route).await {
-                    tracing::warn!(repo = %route.id, principal = %who, "bundles.require: one-shot upload-pack fallback for a client whose bundle download failed");
-                    metrics::counter!("walgit_bundle_fallback_total", "repo" => route.id.to_string()).increment(1);
-                    fallback_warning = Some(format!(
-                        "walgit: WARNING — your git fetched the bundle list but could not apply the bundles \
-                         (a bundle download failed or was cut; see the warnings above). Serving this clone's \
-                         full history through upload-pack ONCE (≈ 32 GB for acme/monorepo, minutes of server \
-                         time); the next such clone within 6 h is refused. Faster next time: retry the clone \
-                         (bundle downloads are cached at the edge), or the blobless form: \
-                         git clone --filter=blob:none --bundle-uri={base}/{repo}.git/bundles/list?filter=blob:none {base}/{repo}.git",
-                        base = request_base_url(st, headers),
-                        repo = route.id
-                    ));
-                } else {
-                    let msg = bundles_required_message(st, headers, route);
-                    return Ok(if req.sideband_all {
-                        let mut buf = sideband_pkt(3, &msg);
-                        pktline::encode_flush(&mut buf);
-                        text_response(
-                            "application/x-git-upload-pack-result",
-                            no_cache_headers(),
-                            buf,
-                        )
-                    } else {
-                        git_err_response("git-upload-pack", &msg)
-                    });
-                }
-            }
             // Narrated fetch: the client accepted sideband-all and wants
             // progress → stream immediately and say what we are doing while
             // the local copy syncs, then hand over to upload-pack.
             if req.sideband_all && !req.no_progress {
-                return Ok(narrated_fetch(st, route, headers, handle, req, fallback_warning).await);
+                return Ok(narrated_fetch(st, route, headers, handle, req).await);
             }
             // Objects are needed from here on. Surface "too big for this
             // instance" as a pkt-line ERR git prints verbatim (with the fix),
@@ -381,26 +328,6 @@ async fn upload_pack_v2(
                 sizes_buf,
             ))
         }
-        "bundle-uri" => {
-            let _guard = handle.sync_refs().await.map_err(wal_err)?;
-            let () = walgit_git::pkt::parse_bundle_uri(&cmd);
-            let base = request_base_url(st, headers);
-            let lines = st
-                .bundles
-                .protocol_v2_lines(&route.id, &base)
-                .await
-                .map_err(bundle_err)?;
-            let mut buf = Vec::with_capacity(256);
-            for l in lines {
-                pktline::encode_text(&mut buf, &l);
-            }
-            pktline::encode_flush(&mut buf);
-            Ok(text_response(
-                "application/x-git-upload-pack-result",
-                no_cache_headers(),
-                buf,
-            ))
-        }
         other => Err(ApiError::BadRequest(format!("unknown v2 command: {other}"))),
     }
 }
@@ -426,60 +353,6 @@ async fn say<W: tokio::io::AsyncWrite + Unpin>(w: &mut W, text: &str) -> bool {
     use tokio::io::AsyncWriteExt;
     let pkt = sideband_pkt(2, &format!("* {text}"));
     w.write_all(&pkt).await.is_ok() && w.flush().await.is_ok()
-}
-
-/// Band-2 lines about bundles, from the client's point of view. A `have` equal to a listed bundle's
-/// tip means git applied that bundle (fresh clone or catch-up); the rest of the list is summarized
-/// per strategy so the reader knows the shape without an inventory.
-fn bundle_narration(
-    list: &walgit_proto::v1::BundleList,
-    haves: &[gix_hash::ObjectId],
-) -> Vec<String> {
-    let have: std::collections::HashSet<String> =
-        haves.iter().map(|h| h.to_hex().to_string()).collect();
-    let mut applied: Vec<&walgit_proto::v1::BundleEntry> = list
-        .bundles
-        .iter()
-        .filter(|b| b.tips.iter().any(|t| have.contains(&t.oid)))
-        .collect();
-    applied.sort_by_key(|b| b.creation_token);
-    // Per strategy: count and bytes, in list order of first appearance.
-    let mut per: Vec<(String, usize, u64)> = Vec::new();
-    for b in &list.bundles {
-        match per.iter_mut().find(|(s, _, _)| *s == b.strategy) {
-            Some(e) => {
-                e.1 += 1;
-                e.2 += b.size;
-            }
-            None => per.push((b.strategy.clone(), 1, b.size)),
-        }
-    }
-    let shape: Vec<String> = per
-        .iter()
-        .map(|(s, n, bytes)| format!("{n} {s} ({})", human(*bytes)))
-        .collect();
-    let mut out = vec![format!(
-        "bundle-uri: {} listed — {}; git takes the newest full and every incremental above it, this server sends only the rest",
-        list.bundles.len(),
-        shape.join(", ")
-    )];
-    if applied.is_empty() {
-        out.push("bundle-uri: none of your haves is a bundle tip — your git did not use the bundles (clone with the recipe from the Clone menu, or check transfer.bundleURI)".into());
-    } else {
-        let bytes: u64 = applied.iter().map(|b| b.size).sum();
-        let newest = applied.last().map_or(0, |b| b.creation_token);
-        let when = chrono::DateTime::from_timestamp(newest as i64, 0)
-            .map(|d| d.format("%Y-%m-%d %H:%MZ").to_string())
-            .unwrap_or_default();
-        let names: Vec<String> = applied.iter().map(|b| b.strategy.clone()).collect();
-        out.push(format!(
-            "bundle-uri: your git applied {} bundle(s) = {} ({}) — history as of {when}; what follows is everything since",
-            applied.len(),
-            human(bytes),
-            names.join(" → ")
-        ));
-    }
-    out
 }
 
 fn human(n: u64) -> String {
@@ -621,7 +494,6 @@ async fn narrated_fetch(
     headers: &HeaderMap,
     handle: &Arc<walgit_wal::RepoHandle>,
     req: walgit_git::UploadPackRequest,
-    fallback_warning: Option<String>,
 ) -> Response {
     let (mut writer, body) = write_body_pipe(256 * 1024);
     let handle = handle.clone();
@@ -632,13 +504,6 @@ async fn narrated_fetch(
         .await
         .ok()
         .map_or_else(|| "anonymous".into(), |p| p.name);
-    // Nothing that can wait (store reads, syncs) happens before the stream
-    // is open and the first band-2 line is out: the bundle facts are read
-    // inside the task, after the greeting.
-    let advertise_bundles = st.cfg.bundles.advertise;
-    let bundles_svc = st.bundles.clone();
-    let route_id = route.id.clone();
-    let base = request_base_url(st, headers);
     let cache_max = st.cfg.cache_budget_bytes();
     let engine = st.cfg.git.upload_pack_engine;
     let max_wants = st.cfg.git.max_wants;
@@ -653,25 +518,7 @@ async fn narrated_fetch(
         {
             return;
         }
-        if let Some(w) = &fallback_warning
-            && !say(&mut writer, w).await
-        {
-            return;
-        }
         let applied = handle.applied_seq();
-        // What the bundles did for THIS client, not the inventory: by the time git sends `fetch` it
-        // has applied the bundles it downloaded, and its `have`s are exactly their tips — so name
-        // them, sum their bytes, and say what the rest of the list was (the bundle-uri *command*
-        // is a plain pkt response and cannot narrate; the fetch does it right after the greeting).
-        let bundle_lines: Vec<String> = if advertise_bundles {
-            match bundles_svc.list(&route_id).await {
-                Ok(Some(l)) if !l.bundles.is_empty() => bundle_narration(&l, &req.haves),
-                Ok(_) => vec!["bundle-uri: no bundles published yet — this clone's history comes through upload-pack".into()],
-                Err(e) => vec![format!("bundle-uri: list unavailable ({e})")],
-            }
-        } else {
-            Vec::new()
-        };
         let _ = say(
             &mut writer,
             &format!(
@@ -686,9 +533,6 @@ async fn narrated_fetch(
             ),
         )
         .await;
-        for l in &bundle_lines {
-            let _ = say(&mut writer, l).await;
-        }
         // The initial fetch of a blobless clone is the one moment the user can still be told: the
         // lazy blob fetch that follows a checkout carries `no-progress`, so nothing said there is seen.
         if req.haves.is_empty()
@@ -715,7 +559,7 @@ async fn narrated_fetch(
             Err(e) => {
                 let msg = match &e {
                     walgit_wal::WalError::TooLarge { bytes, max } => format!(
-                        "walgit: this repository's pack set is {} — larger than this instance's cache ({}); clone it with bundle-uri:\n  git config --global transfer.bundleURI true\n  git clone {base}/{repo}.git\n(bundle list: {base}/{repo}.git/bundles/list)",
+                        "walgit: this repository's pack set is {} — larger than this instance's cache ({}); retry on a host with enough capacity or use a bounded clone",
                         human(*bytes),
                         human(if *max == 0 { cache_max } else { *max })
                     ),
@@ -760,64 +604,10 @@ async fn upload_pack_v0(
     route: &RepoRoute,
     headers: &HeaderMap,
     handle: &Arc<walgit_wal::RepoHandle>,
-    mut reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+    reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
 ) -> Result<Response, ApiError> {
     if let Some(r) = not_served_here(st, &route.id, "git-upload-pack").await {
         return Ok(r);
-    }
-    // bundles.require (see the v2 path): a v0 request lists its haves in the
-    // body; buffer it (negotiation bodies are small) to look.
-    if st.cfg.bundles_required(route.id.owner(), route.id.name()) {
-        use tokio::io::AsyncReadExt;
-        const MAX: usize = 16 * 1024 * 1024;
-        let mut buf = Vec::new();
-        let mut chunk = vec![0u8; 64 * 1024];
-        loop {
-            let n = reader
-                .read(&mut chunk)
-                .await
-                .map_err(|e| ApiError::BadRequest(format!("body read: {e}")))?;
-            if n == 0 {
-                break;
-            }
-            buf.extend_from_slice(&chunk[..n]);
-            if buf.len() > MAX {
-                return Err(ApiError::BadRequest("upload-pack request too large".into()));
-            }
-        }
-        // Walk the pkt-lines: haves, and the bounding lines (`deepen*`,
-        // `filter`) — capability words on the first want line also say
-        // "deepen-since", so look at line starts, not substrings.
-        let (mut has_have, mut bounded, mut pos) = (false, false, 0usize);
-        while pos + 4 <= buf.len() {
-            let Ok(len) =
-                usize::from_str_radix(std::str::from_utf8(&buf[pos..pos + 4]).unwrap_or("zz"), 16)
-            else {
-                break;
-            };
-            if len < 4 {
-                pos += 4; // flush / delim
-                continue;
-            }
-            let line = &buf[(pos + 4).min(buf.len())..(pos + len).min(buf.len())];
-            if line.starts_with(b"have ") {
-                has_have = true;
-            }
-            if line.starts_with(b"deepen") || line.starts_with(b"filter ") {
-                bounded = true;
-            }
-            if line.starts_with(b"done") {
-                break;
-            }
-            pos += len;
-        }
-        if !has_have && !bounded {
-            return Ok(git_err_response(
-                "git-upload-pack",
-                &bundles_required_message(st, headers, route),
-            ));
-        }
-        reader = Box::new(std::io::Cursor::new(buf));
     }
     if let Err(e) = handle.sync().await {
         return Ok(match e {
@@ -1613,76 +1403,8 @@ fn too_large_message(
 ) -> String {
     let base = request_base_url(st, headers);
     format!(
-        "walgit: {e}.\n\
-         This repository is served from static bundles; clone it with bundle-uri enabled:\n\
-         \n\
-           git config --global transfer.bundleURI true\n\
-           git clone {base}/{}.git\n\
-         \n\
-         (bundle list: {base}/{}.git/bundles/list)\n",
-        route.id, route.id
-    )
-}
-
-/// How often one principal may fall back to an upload-pack full clone of a
-/// `bundles.require` repository.
-const FALLBACK_EVERY: std::time::Duration = std::time::Duration::from_hours(6);
-/// How recent the principal's `bundles/list` fetch must be to count as "tried".
-const ATTEMPT_WINDOW: std::time::Duration = std::time::Duration::from_hours(1);
-
-/// D17 amendment: `Some(principal)` when this zero-have full fetch may go to
-/// upload-pack — the principal fetched the repo's bundle list within the hour
-/// (it tried bundle-uri; git does not retry a failed bundle download) and has
-/// not used the fallback in the last `FALLBACK_EVERY`. Records the use.
-async fn bundle_fallback_allowed(
-    st: &AppState,
-    headers: &HeaderMap,
-    route: &RepoRoute,
-) -> Option<String> {
-    let who = st.auth.require_read(headers).await.ok()?.name;
-    if who.is_empty() || who == "anonymous" {
-        return None;
-    }
-    let key = format!("{}\0{}", route.id, who);
-    let tried = st.caches.bundle_attempts.get(&key)?;
-    if tried.elapsed() > ATTEMPT_WINDOW {
-        return None;
-    }
-    let fkey = format!("{key}\0fallback");
-    if st
-        .caches
-        .bundle_attempts
-        .get(&fkey)
-        .is_some_and(|t| t.elapsed() < FALLBACK_EVERY)
-    {
-        return None;
-    }
-    st.caches
-        .bundle_attempts
-        .insert(fkey, std::time::Instant::now());
-    Some(who)
-}
-
-/// `bundles.require`: what a zero-have fetch is told when it may not fall back:
-/// either it never tried bundle-uri, or it already used its one fallback.
-fn bundles_required_message(st: &AppState, headers: &HeaderMap, route: &RepoRoute) -> String {
-    let base = request_base_url(st, headers);
-    format!(
-        "walgit: {repo} is served from static bundles; a full clone fetches its history through bundle-uri \
-         (this request had no haves, no depth and no filter).\n\
-         \n\
-         If git printed 'failed to download bundle' above: a bundle download failed or was cut and git does not \
-         retry it. Retry the clone (downloads are cached at the edge) — one clone per 6 h may fall back to \
-         upload-pack after a failed attempt; you may have used it.\n\
-         Otherwise turn bundle-uri on:\n\
-         \n\
-           git config --global transfer.bundleURI true\n\
-           git clone {base}/{repo}.git\n\
-         \n\
-         Blobless (developer shape): git clone --filter=blob:none --bundle-uri={base}/{repo}.git/bundles/list?filter=blob:none {base}/{repo}.git\n\
-         CI / shallow: git clone --depth=1 … (never refused). Already cloned? `git fetch` works as usual.\n\
-         Bundle list: {base}/{repo}.git/bundles/list\n",
-        repo = route.id,
+        "walgit: {e}. Retry on a host with enough capacity, or use a bounded clone:\n  git clone --depth=1 {base}/{}.git\n",
+        route.id
     )
 }
 
@@ -1736,9 +1458,9 @@ fn too_many_wants_message(
         "walgit: this fetch asks for {wants} objects at once (this host's bound is {max}). That is what a \
          `git clone --filter=blob:none` does right after cloning when it checks out HEAD: every blob of the tree \
          in one request. Clone blobless with a sparse or no checkout instead, then fetch blobs as you need them:\n  \
-         git clone --filter=blob:none --sparse --bundle-uri={base}/{repo}.git/bundles/list?filter=blob:none {base}/{repo}.git\n  \
-         git sparse-checkout add <dir>…\nor, for the whole tree, a full clone through bundles: \
-         git clone -c fetch.bundleURI={base}/{repo}.git/bundles/catchup {base}/{repo}.git",
+         git clone --filter=blob:none --sparse {base}/{repo}.git\n  \
+         git sparse-checkout add <dir>…\nor, for the whole tree, a full clone: \
+         git clone {base}/{repo}.git",
         max = st.cfg.git.max_wants,
     )
 }
@@ -1782,7 +1504,4 @@ pub(crate) fn wal_err(e: walgit_wal::WalError) -> ApiError {
         }
         _ => ApiError::Internal(format!("wal: {e}")),
     }
-}
-fn bundle_err(e: walgit_bundle::BundleError) -> ApiError {
-    ApiError::Internal(format!("bundle: {e}"))
 }

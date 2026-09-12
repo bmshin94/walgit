@@ -1,5 +1,5 @@
 //! Repository maintenance operations ("make the repo great"): fsck, compaction,
-//! bundle builds, checkpoints, re-materialize. Shared by the background loops
+//! checkpoints, re-materialize. Shared by the background loops
 //! (`walgit serve` roles), the CLI, and the web UI's `POST …/ops/{op}` route,
 //! which streams the op's log as SSE and records the outcome per instance.
 
@@ -93,17 +93,9 @@ pub const OPS: &[OpSpec] = &[
         mutating: true,
     },
     OpSpec {
-        id: "bundle",
-        label: "Bundle",
-        description: "Build and publish a bundle-uri bundle now (strategy=<name>, default: the first full strategy; \
-                      strategy=due builds whatever the schedule says is due).",
-        params: &["strategy"],
-        mutating: true,
-    },
-    OpSpec {
         id: "checkpoint",
         label: "Checkpoint",
-        description: "Write a checkpoint (pack set + ref snapshot) at the current head so cold materialize and bundles start from here.",
+        description: "Write a checkpoint (pack set + ref snapshot) at the current head so cold materialize starts from here.",
         params: &[],
         mutating: true,
     },
@@ -432,131 +424,6 @@ async fn run(
             .map_err(|e| e.to_string())?;
             let summary = out.summary();
             Ok((summary, serde_json::to_value(&out).unwrap_or_default()))
-        }
-        "bundle" => {
-            if !state.cfg.bundles.enabled {
-                return Err("bundles are disabled in config".into());
-            }
-            let strategy = params.get("strategy").cloned().unwrap_or_default();
-            if let Some(slot) = params.get("slot").and_then(|v| v.parse::<u64>().ok()) {
-                // One calendar slot (the maintenance loop's unit): content as of the slot.
-                log(format!(
-                    "building {strategy} slot {slot} ({})",
-                    walgit_bundle::slots::from_epoch(slot)
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map_or(0, |d| d.as_secs())
-                ));
-                // A FULL slot of a repository that has a tier-2 base is a compose
-                // of that base (header = refs at the base's seq) — never a
-                // `pack-objects` of the whole history into a file (a large repository: 32 GB
-                // through this host). The maintainer rebuilds the base first on
-                // an ssd host when pushes landed since (`Unit::BaseRebuild`).
-                let cfg_eff = handle.effective_config();
-                let is_full = cfg_eff
-                    .bundles
-                    .strategy
-                    .iter()
-                    .any(|s| s.name == strategy && s.kind == walgit_config::BundleKind::Full);
-                if is_full && walgit_wal::base_pack(&handle.manifest()).is_some() {
-                    log(format!(
-                        "{strategy} slot {slot}: composing header ∘ tier-2 base (no bytes through this host)"
-                    ));
-                    let e = crate::bundles::compose_full_from_base(
-                        &state.registry,
-                        id,
-                        &strategy,
-                        &cfg_eff,
-                        slot,
-                    )
-                    .await
-                    .map_err(|e| e.to_string())?;
-                    state.caches.bundle_list.invalidate(&id.to_string());
-                    return Ok((
-                        format!(
-                            "slot {} {} composed: {} bytes at seq {}, token {}",
-                            e.strategy, slot, e.size, e.seq, e.creation_token
-                        ),
-                        serde_json::json!({ "id": e.id, "strategy": e.strategy, "slot": slot, "size": e.size, "seq": e.seq, "key": e.key, "built": true, "composed": true }),
-                    ));
-                }
-                let entry = state
-                    .bundles
-                    .build_slot_unit(id, &strategy, slot)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                // The list changed (or a skip was recorded): this host's next
-                // `GET bundles/list` must show it, not a cached render.
-                state.caches.bundle_list.invalidate(&id.to_string());
-                return Ok(match entry {
-                    Some(e) => (
-                        format!(
-                            "slot {} {} built: {} bytes at seq {}, token {}",
-                            e.strategy, slot, e.size, e.seq, e.creation_token
-                        ),
-                        serde_json::json!({ "id": e.id, "strategy": e.strategy, "slot": slot, "size": e.size, "seq": e.seq, "key": e.key, "built": true }),
-                    ),
-                    None => (
-                        format!(
-                            "slot {strategy} {slot}: nothing to build (built elsewhere, no new objects, or no refs at that time)"
-                        ),
-                        serde_json::json!({ "slot": slot, "built": false }),
-                    ),
-                });
-            }
-            if strategy == "due" {
-                log("building all due bundle strategies".into());
-                let entries = state
-                    .bundles
-                    .run_due(id, std::time::SystemTime::now())
-                    .await
-                    .map_err(|e| e.to_string())?;
-                for e in &entries {
-                    log(format!(
-                        "built {} ({} bytes, token {})",
-                        e.strategy, e.size, e.creation_token
-                    ));
-                }
-                state.caches.bundle_list.invalidate(&id.to_string());
-                let names: Vec<String> = entries.iter().map(|e| e.strategy.clone()).collect();
-                return Ok((
-                    format!("built {} due bundle(s)", entries.len()),
-                    serde_json::json!({ "built": names }),
-                ));
-            }
-            let strategy = if strategy.is_empty() {
-                state
-                    .cfg
-                    .bundles
-                    .strategy
-                    .iter()
-                    .find(|s| s.kind == walgit_config::BundleKind::Full)
-                    .or(state.cfg.bundles.strategy.first())
-                    .map(|s| s.name.clone())
-                    .ok_or_else(|| "no bundle strategies configured".to_string())?
-            } else {
-                strategy
-            };
-            log(format!(
-                "building bundle strategy {strategy} (git bundle create on the local copy, upload, CAS list)"
-            ));
-            let entry = state
-                .bundles
-                .build(id, &strategy)
-                .await
-                .map_err(|e| e.to_string())?;
-            state.caches.bundle_list.invalidate(&id.to_string());
-            let summary = format!(
-                "bundle {} built: {} bytes at seq {}, creationToken {}",
-                entry.strategy, entry.size, entry.seq, entry.creation_token
-            );
-            Ok((
-                summary,
-                serde_json::json!({
-                    "id": entry.id, "strategy": entry.strategy, "kind": entry.kind,
-                    "size": entry.size, "seq": entry.seq, "creation_token": entry.creation_token,
-                    "key": entry.key,
-                }),
-            ))
         }
         "checkpoint" => {
             // Refs-level: a checkpoint is manifest + ref snapshot, it never

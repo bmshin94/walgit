@@ -1,6 +1,6 @@
 //! Local git repository engine: gix in-process for odb/refs/revwalk/pack
 //! generation; upstream git subprocess for ingest (`index-pack`), repack,
-//! bundle, and the selectable `Engine::Git` upload-pack fallback. See AGENTS.md
+//! and the selectable `Engine::Git` upload-pack fallback. See AGENTS.md
 //! D2 and docs/CONTRACT.md walgit-git.
 
 pub mod follow;
@@ -472,12 +472,6 @@ pub struct RepackOptions {
 pub struct RepackResult {
     pub new_packs: Vec<PackInfo>,
     pub removed: Vec<gix_hash::ObjectId>,
-}
-
-#[derive(Debug, Clone)]
-pub struct BundleInfo {
-    pub size: u64,
-    pub pack_offset: u64,
 }
 
 /// Outcome of [`LocalRepo::fsck_streaming`].
@@ -2456,43 +2450,6 @@ impl LocalRepo {
         Ok(())
     }
 
-    pub async fn write_bundle(
-        &self,
-        out: &Path,
-        refs: &[String],
-        exclude: &[gix_hash::ObjectId],
-    ) -> Result<BundleInfo, GitError> {
-        // Build rev args fed to `git bundle create <out> --stdin`.
-        let mut input = String::new();
-        for r in refs {
-            input.push_str(r);
-            input.push('\n');
-        }
-        for e in exclude {
-            input.push('^');
-            input.push_str(&e.to_hex().to_string());
-            input.push('\n');
-        }
-        let out_str = out.to_string_lossy().to_string();
-        let bundle_out = self
-            .run_git_stdin(
-                "bundle",
-                &["create", out_str.as_str(), "--stdin"],
-                input.as_bytes(),
-            )
-            .await?;
-        if !bundle_out.status.success() {
-            return Err(GitError::Subprocess {
-                cmd: "git bundle create".into(),
-                status: bundle_out.status.code(),
-                stderr: String::from_utf8_lossy(&bundle_out.stderr).into_owned(),
-            });
-        }
-        let size = std::fs::metadata(out).map_or(0, |m| m.len());
-        let pack_offset = locate_pack_offset(out).unwrap_or(size);
-        Ok(BundleInfo { size, pack_offset })
-    }
-
     /// Full `git fsck` of the local copy, streaming every output line (stdout
     /// and stderr, interleaved by arrival) to `on_line`. `connectivity_only`
     /// skips object content checks (much faster on big repos). Returns the
@@ -2707,30 +2664,6 @@ impl LocalRepo {
 // ---------------------------------------------------------------------------
 // Free functions
 // ---------------------------------------------------------------------------
-
-/// Render a git bundle v2 header from a ref snapshot and prerequisites, so a
-/// full bundle can be assembled as header + existing pack bytes without git.
-pub fn bundle_header(
-    refs: &RefSnapshotData,
-    prerequisites: &[gix_hash::ObjectId],
-    format: ObjectFormat,
-) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(b"# v2 git bundle\n");
-    for p in prerequisites {
-        out.extend_from_slice(p.to_hex().to_string().as_bytes());
-        out.extend_from_slice(b" \n");
-    }
-    for r in &refs.refs {
-        out.extend_from_slice(r.oid.as_bytes());
-        out.push(b' ');
-        out.extend_from_slice(r.name.as_bytes());
-        out.push(b'\n');
-    }
-    out.push(b'\n');
-    let _ = format;
-    out
-}
 
 // ---------------------------------------------------------------------------
 // Internals
@@ -3232,33 +3165,6 @@ pub fn build_v2_fetch_request(req: &UploadPackRequest) -> Vec<u8> {
     }
     pkt::encode_flush(&mut buf);
     buf
-}
-
-fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
-}
-
-fn locate_pack_offset(path: &Path) -> Option<u64> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut f = std::fs::File::open(path).ok()?;
-    // The pack payload starts with the literal "PACK". Scan the file head.
-    let mut buf = vec![0u8; 8 * 1024];
-    let mut pos = 0u64;
-    loop {
-        let n = f.read(&mut buf).ok()?;
-        if n == 0 {
-            return None;
-        }
-        if let Some(i) = find_subsequence(buf.get(..n)?, b"PACK") {
-            return Some(pos + i as u64);
-        }
-        // Seek back a little to handle boundary splits.
-        if n < buf.len() {
-            return None;
-        }
-        pos += n as u64 - 3;
-        f.seek(SeekFrom::Start(pos)).ok()?;
-    }
 }
 
 // ---------------------------------------------------------------------------
