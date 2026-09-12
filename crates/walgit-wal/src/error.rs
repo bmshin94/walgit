@@ -32,6 +32,10 @@ pub enum WalError {
     Invalid(String),
     #[error("retry exhausted after {attempts} attempts")]
     Retry { attempts: u32 },
+    /// The CAS may have committed or may still land. Absence of evidence is
+    /// not a definite rejection and must never become report-status `ng`.
+    #[error("commit outcome unknown: {0}")]
+    CommitUnknown(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     /// The live pack set does not fit this instance's cache (`cache.max_bytes`);

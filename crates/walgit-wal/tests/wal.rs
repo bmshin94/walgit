@@ -2749,3 +2749,163 @@ async fn a_landed_cas_is_ok_even_when_the_local_apply_fails_and_the_next_sync_re
     );
     assert_eq!(handle.applied_seq(), 2);
 }
+
+#[tokio::test]
+async fn noop_receipts_never_claim_a_siblings_log_entry() {
+    let cache = tempfile::tempdir().unwrap();
+    let store = MemoryStore::shared();
+    let registry = Registry::new(store, Arc::new(make_config(cache.path(), 20)));
+    let handle = registry
+        .create(&repo_id("o", "noop"), ObjectFormat::Sha1)
+        .await
+        .unwrap();
+    let work = WorkRepo::new();
+    let tip = work.commit("first", "content");
+    let pack = ingest_pack_data(&handle, work.create_pack()).await.unwrap();
+    // Empty-ref pack publication is not a back door into the durable inventory.
+    let error = handle
+        .publish_push(Some(pack), make_txn(vec![]), HashMap::new())
+        .await;
+    assert!(matches!(error, Err(walgit_wal::WalError::Invalid(_))));
+    assert_eq!(handle.manifest().head_seq, 0);
+    assert!(handle.manifest().packs.is_empty());
+    let pack = ingest_pack_data(&handle, work.create_pack()).await.unwrap();
+    handle
+        .publish_push(
+            Some(pack),
+            make_txn(vec![("refs/heads/main", "", &tip)]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+    let unchanged = make_txn(vec![("refs/heads/main", &tip, &tip)]);
+    for _ in 0..2 {
+        let receipt = handle
+            .publish_push(None, unchanged.clone(), HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(receipt.seq, 0);
+        assert!(receipt.per_ref.iter().all(|(_, status)| status.is_ok()));
+        assert_eq!(handle.manifest().head_seq, 1);
+    }
+    let (noop, changed) = tokio::join!(
+        handle.publish_push(None, unchanged.clone(), HashMap::new()),
+        handle.publish_push(
+            None,
+            make_txn(vec![("refs/heads/other", "", &tip)]),
+            HashMap::new()
+        ),
+    );
+    assert_eq!(noop.unwrap().seq, 0);
+    assert_eq!(changed.unwrap().seq, 2);
+    let (noop, rejected) = tokio::join!(
+        handle.publish_push(None, unchanged, HashMap::new()),
+        handle.publish_push(
+            None,
+            make_txn(vec![("refs/heads/main", "", &tip)]),
+            HashMap::new()
+        ),
+    );
+    assert_eq!(noop.unwrap().seq, 0);
+    let rejected = rejected.unwrap();
+    assert_eq!(rejected.seq, 0);
+    assert!(rejected.per_ref.iter().all(|(_, status)| status.is_err()));
+    assert_eq!(handle.manifest().head_seq, 2);
+    assert_eq!(handle.read_log(1, None).await.unwrap().len(), 2);
+    let refused = handle
+        .publish_push(
+            None,
+            make_txn(vec![
+                ("refs/heads/partial", "", &tip),
+                ("refs/heads/main", "", &tip),
+            ]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(refused.seq, 0);
+    assert!(refused.per_ref.iter().all(|(_, status)| status.is_err()));
+    assert!(
+        handle
+            .local()
+            .ref_view()
+            .unwrap()
+            .get("refs/heads/partial")
+            .is_none()
+    );
+    let multi = handle
+        .publish_push(
+            None,
+            make_txn(vec![
+                ("refs/heads/left", "", &tip),
+                ("refs/heads/right", "", &tip),
+            ]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(multi.seq, 3);
+    assert_eq!(multi.per_ref.len(), 2);
+    assert!(multi.per_ref.iter().all(|(_, status)| status.is_ok()));
+}
+
+#[tokio::test]
+async fn lost_cas_reply_is_resolved_or_unknown_without_losing_the_commit() {
+    use walgit_store::fault::{FaultPlan, FaultStore};
+    let cache = tempfile::tempdir().unwrap();
+    let truth = MemoryStore::shared();
+    let link = FaultStore::new(truth, "lost-reply", 1);
+    let registry = Registry::new(link.clone(), Arc::new(make_config(cache.path(), 0)));
+    let handle = registry
+        .create(&repo_id("o", "unknown"), ObjectFormat::Sha1)
+        .await
+        .unwrap();
+    let work = WorkRepo::new();
+    let tip = work.commit("first", "content");
+    let pack = ingest_pack_data(&handle, work.create_pack()).await.unwrap();
+    handle
+        .publish_push(
+            Some(pack),
+            make_txn(vec![("refs/heads/main", "", &tip)]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+    for (name, hide_evidence) in [("resolved", false), ("unknown", true)] {
+        link.set(FaultPlan {
+            p_err_after: 1.0,
+            only_keys: Some(vec!["manifest.pb".into()]),
+            deny_keys: if hide_evidence {
+                vec!["manifest.pb".into()]
+            } else {
+                vec![]
+            },
+            ..Default::default()
+        });
+        let reference = format!("refs/heads/{name}");
+        let result = handle
+            .publish_push_synced(None, make_txn(vec![(&reference, "", &tip)]), HashMap::new())
+            .await;
+        if hide_evidence {
+            assert!(matches!(
+                result,
+                Err(walgit_wal::WalError::CommitUnknown(_))
+            ));
+        } else {
+            assert!(
+                result
+                    .unwrap()
+                    .per_ref
+                    .iter()
+                    .all(|(_, status)| status.is_ok())
+            );
+        }
+        link.heal();
+        drop(handle.sync_refs().await.unwrap());
+        assert_eq!(
+            handle.local().ref_view().unwrap().get(&reference),
+            Some(tip.clone())
+        );
+    }
+    assert_eq!(handle.read_log(1, None).await.unwrap().len(), 3);
+}
