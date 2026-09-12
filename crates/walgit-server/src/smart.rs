@@ -104,9 +104,10 @@ pub async fn info_refs(
             buf.extend_from_slice(&cached);
         } else {
             let start = buf.len();
+            let cfg = handle.validated_effective_config().map_err(wal_err)?;
             handle
                 .local()
-                .advertise_refs_v0(service, &mut buf)
+                .advertise_refs_v0(service, &mut buf, Some(&cfg.refs.advertise))
                 .map_err(git_err)?;
             let advert_bytes = buf[start..].to_vec();
             st.caches
@@ -148,7 +149,7 @@ async fn v2_capability_advert(
     // With sideband-all every response line is sideband-framed, which lets us
     // narrate what the server is doing (band 2 → "remote: * …") *before* the
     // packfile section: auth, WAL sync, materialization progress. Both engines frame their sections that way.
-    fetch.push_str(" sideband-all");
+    fetch.push_str(" sideband-all packfile-uris packfile-indexes");
     pktline::encode_text(buf, &format!("{fetch}\n"));
     pktline::encode_text(buf, "server-option\n");
     let fmt = match handle.local().object_format() {
@@ -213,7 +214,7 @@ async fn upload_pack_v2(
             };
             let repo_key = route.id.to_string();
             let version = handle.manifest_version();
-            let lines = if let Some(lines) =
+            let mut lines = if let Some(lines) =
                 st.caches
                     .ref_advert
                     .get_v2_ls_refs(&repo_key, version.as_ref(), &args)
@@ -229,6 +230,27 @@ async fn upload_pack_v2(
                 );
                 lines
             };
+            let all_refs = cmd.cap("server-option") == Some("ref-view=all")
+                || cmd
+                    .args
+                    .iter()
+                    .any(|arg| arg == "server-option=ref-view=all");
+            if !all_refs {
+                let cfg = handle.validated_effective_config().map_err(wal_err)?;
+                let refs = handle.local().ref_view().map_err(git_err)?;
+                lines.retain(|line| {
+                    let name = if line.name == "HEAD" {
+                        refs.head_target()
+                    } else {
+                        &line.name
+                    };
+                    walgit_config::refs::selectors_match(
+                        &cfg.refs.advertise,
+                        name,
+                        refs.head_target(),
+                    )
+                });
+            }
             let mut buf = Vec::with_capacity(1024);
             for line in &lines {
                 pktline::encode_text(&mut buf, &line.render(&args));
@@ -289,6 +311,7 @@ async fn upload_pack_v2(
             // not be removed mid-clone.
             let handle = handle.clone();
             let engine = st.cfg.git.upload_pack_engine;
+            let uri_base = anonymous_uri_base(st, route, headers);
             tokio::spawn(async move {
                 let guard = match handle.sync().await {
                     Ok(g) => g,
@@ -298,7 +321,7 @@ async fn upload_pack_v2(
                     }
                 };
                 // guard is held until the task ends (after streaming completes).
-                if let Err(e) = run_fetch(&handle, engine, req, writer, None).await {
+                if let Err(e) = run_fetch(&handle, engine, req, writer, uri_base).await {
                     tracing::warn!(error = ?e, "upload_pack v2 fetch failed");
                 }
                 drop(guard);
@@ -367,12 +390,13 @@ fn human(n: u64) -> String {
 async fn run_fetch<W: tokio::io::AsyncWrite + Unpin + Send>(
     handle: &Arc<walgit_wal::RepoHandle>,
     engine: walgit_config::UploadPackEngine,
-    req: walgit_git::UploadPackRequest,
-    writer: W,
-    _progress: Option<()>,
+    mut req: walgit_git::UploadPackRequest,
+    mut writer: W,
+    uri_base: Option<String>,
 ) -> Result<(), walgit_git::GitError> {
     let local = handle.local().clone();
     if !handle.remote_served().is_empty() {
+        warn_large_dynamic_clone(handle, &req, &mut writer).await;
         let reader = handle
             .remote_reader()
             .await
@@ -413,17 +437,62 @@ async fn run_fetch<W: tokio::io::AsyncWrite + Unpin + Send>(
         e => e,
     };
     match engine {
-        walgit_config::UploadPackEngine::Gix | walgit_config::UploadPackEngine::Auto => local
-            .upload_pack_gix_with(req, writer, None)
-            .await
-            .map(|_| ()),
+        walgit_config::UploadPackEngine::Gix | walgit_config::UploadPackEngine::Auto => {
+            warn_large_dynamic_clone(handle, &req, &mut writer).await;
+            local
+                .upload_pack_gix_with(req, writer, None)
+                .await
+                .map(|_| ())
+        }
         walgit_config::UploadPackEngine::Git => {
+            if let Some(base) = uri_base
+                && let Some(selection) = crate::packfile_uri::select(handle, &req, &base).await
+            {
+                return local.upload_pack_with_uris(req, &selection, writer).await;
+            }
+            warn_large_dynamic_clone(handle, &req, &mut writer).await;
+            req.packfile_uris_protocols.clear();
             let body = walgit_git::build_v2_fetch_request(&req);
             local
                 .upload_pack_raw(walgit_git::pkt::Protocol::V2, &body[..], writer)
                 .await
         }
     }
+}
+
+async fn warn_large_dynamic_clone<W: tokio::io::AsyncWrite + Unpin>(
+    handle: &walgit_wal::RepoHandle,
+    request: &walgit_git::UploadPackRequest,
+    writer: &mut W,
+) {
+    if request.sideband_all
+        && !request.no_progress
+        && request.done
+        && request.haves.is_empty()
+        && request.filter.is_none()
+        && request.deepen.is_none()
+        && request.deepen_since.is_none()
+        && request.deepen_not.is_empty()
+        && request.shallow.is_empty()
+        && handle
+            .manifest()
+            .packs
+            .iter()
+            .map(|p| p.pack_size)
+            .sum::<u64>()
+            >= handle
+                .effective_config()
+                .packfile_uri
+                .uri_min_bytes
+                .as_u64()
+    {
+        let _ = say(writer, "WARNING: reusable pack delivery is unavailable for this request; this full clone uses dynamic transfer and may take longer. Use a shallow or filtered clone when appropriate.").await;
+    }
+}
+
+fn anonymous_uri_base(st: &AppState, route: &RepoRoute, headers: &HeaderMap) -> Option<String> {
+    (st.cfg.server.auth.mode == walgit_config::AuthMode::None || st.cfg.server.auth.anonymous_read)
+        .then(|| format!("{}/{}", request_base_url(st, headers), route.id))
 }
 
 /// `handle.sync()` while narrating on band 2: the repo's progress packets
@@ -506,6 +575,7 @@ async fn narrated_fetch(
         .map_or_else(|| "anonymous".into(), |p| p.name);
     let cache_max = st.cfg.cache_budget_bytes();
     let engine = st.cfg.git.upload_pack_engine;
+    let uri_base = anonymous_uri_base(st, route, headers);
     let max_wants = st.cfg.git.max_wants;
     tokio::spawn(async move {
         use tokio::io::AsyncWriteExt;
@@ -587,7 +657,7 @@ async fn narrated_fetch(
             ),
         )
         .await;
-        if let Err(e) = run_fetch(&handle, engine, req, writer, None).await {
+        if let Err(e) = run_fetch(&handle, engine, req, writer, uri_base).await {
             tracing::warn!(error = ?e, "narrated upload_pack v2 fetch failed");
         }
         drop(guard);
@@ -1205,6 +1275,7 @@ async fn parse_fetch_request(
         shallow: Vec::new(),
         want_refs: Vec::new(),
         packfile_uris_protocols: Vec::new(),
+        packfile_indexes: false,
     };
     loop {
         let line = walgit_git::pkt::read_pkt_line(&mut reader)
@@ -1254,7 +1325,9 @@ async fn parse_fetch_request(
                 } else if let Some(r) = s.strip_prefix("want-ref ") {
                     req.want_refs.push(r.to_string());
                 } else if let Some(p) = s.strip_prefix("packfile-uris ") {
-                    req.packfile_uris_protocols = p.split(' ').map(String::from).collect();
+                    req.packfile_uris_protocols = p.split(',').map(String::from).collect();
+                } else if s == "packfile-indexes" {
+                    req.packfile_indexes = true;
                 }
             }
         }
@@ -1479,7 +1552,7 @@ fn git_err_response(service: &str, msg: &str) -> Response {
     )
 }
 
-fn auth_err(e: crate::auth::AuthError) -> ApiError {
+pub(crate) fn auth_err(e: crate::auth::AuthError) -> ApiError {
     match e {
         crate::auth::AuthError::Invalid | crate::auth::AuthError::Unauthorized => {
             ApiError::Unauthorized

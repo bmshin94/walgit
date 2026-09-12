@@ -128,10 +128,16 @@ have repository-local `fetch.bundleURI` pointing at removed catch-up routes. Exp
 in affected clones; inspect global/origin-scoped configuration too if an operator previously added it. Do not
 silently rewrite users' global Git configuration as part of a server upgrade.
 
-Standard clients retain dynamic fetch/clone. `fetch.uriProtocols=https` can negotiate standard URI delivery once
-the server path is implemented and tested. Protected URI acceleration requires a distributable, license-reviewed
+Standard clients retain dynamic fetch/clone. `fetch.uriProtocols=https` can negotiate standard URI delivery on
+the native engine for anonymous-read repositories. Remote/gix serving stays dynamic. Protected URI acceleration requires a distributable, license-reviewed
 client with verified authenticated downloads; version strings alone are insufficient. Until that gate passes,
 document protected dynamic fallback honestly. Never open protected static routes to anonymous requests.
+
+Normal discovery advertises configured `refs.advertise` selectors, independently of packing groups. The
+default includes heads and tags. A complete v2 mirror or backup must explicitly request all namespaces:
+`git -c protocol.version=2 clone --mirror --server-option=ref-view=all <url>`; subsequent complete fetches
+also need `--server-option=ref-view=all`. This changes discovery, not authorization. Receive-pack continues
+to see the complete ref set. A v0 client uses the configured advertisement selectors.
 
 ## Data retention and release evidence
 

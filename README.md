@@ -64,9 +64,10 @@ walgit takes that as-is, and adds what a *monorepo on small machines* needs: ser
 repository whose packs will never fit on the instance (a **remote reader** over HTTP range requests), keeping
 commits and trees local while blobs stay in the bucket (the **history pack**).
 
-**Packfile migration:** bundle runtime has been removed; clone/fetch currently use dynamic upload-pack.
-Negotiated reusable packs are the next delivery design, with exact graph proofs and ordinary authenticated
-URLs. They are not wired by the removal-only change. Read the [design](docs/PACKFILE_URI_DESIGN.md) and
+**Packfile migration:** bundle runtime has been removed. Native Git can deliver proven reusable packs plus
+the uncovered graph for anonymous-read repositories. Protected repositories and remote/gix serving use
+dynamic upload-pack; protected URI clients and large-repository performance remain release gates.
+Read the [design](docs/PACKFILE_URI_DESIGN.md) and
 [migration guide](docs/PACKFILE_MIGRATION.md), especially saved settings and existing client catch-up config.
 
 ## What it does

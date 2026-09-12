@@ -498,7 +498,7 @@ mod tests {
         // Measure: cache miss (first render).
         let start = Instant::now();
         let mut buf = Vec::with_capacity(4 * 1024 * 1024);
-        repo.advertise_refs_v0(Service::UploadPack, &mut buf)
+        repo.advertise_refs_v0(Service::UploadPack, &mut buf, None)
             .unwrap();
         let render_ms = start.elapsed().as_millis();
         let advert_bytes = buf.len();

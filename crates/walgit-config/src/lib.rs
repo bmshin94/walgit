@@ -1689,16 +1689,12 @@ webhook_secret = "s"
 pub struct PackfileUriConfig {
     pub uri_min_bytes: ByteSize,
     pub max_uris_per_fetch: usize,
-    pub refuse_packfile_incompatible_git: bool,
-    pub refuse_unbounded_clone_without_uris: bool,
 }
 impl Default for PackfileUriConfig {
     fn default() -> Self {
         Self {
             uri_min_bytes: ByteSize::mib(32),
             max_uris_per_fetch: 64,
-            refuse_packfile_incompatible_git: true,
-            refuse_unbounded_clone_without_uris: false,
         }
     }
 }

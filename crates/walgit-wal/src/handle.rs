@@ -445,6 +445,14 @@ impl RepoHandle {
         Ok(guard)
     }
 
+    /// Revalidate immutable download membership without materializing pack data.
+    /// Bucket existence alone never authorizes a pack or index download.
+    pub async fn serves_pack_fresh(&self, checksum: &str) -> Result<bool, WalError> {
+        let _sync = self.sync_mutex.lock().await;
+        self.sync_locked_inner(&tracing::Span::current()).await?;
+        Ok(self.manifest().serves_pack(checksum))
+    }
+
     /// Whether a refs-level sync should pull the serving copy in the background:
     /// configured, not yet reconciled, this host serves the repository's objects
     /// (placement — a host that does not never pulls its packs, not even in the

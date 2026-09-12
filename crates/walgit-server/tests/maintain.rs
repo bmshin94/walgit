@@ -88,6 +88,7 @@ async fn classification_preserves_push_bytes_and_shared_group_cuts_settle() -> a
             "clone",
             "-q",
             "--mirror",
+            "--server-option=ref-view=all",
             &cold.repo_url("o", "shared"),
             clone.path().to_str().unwrap(),
         ],
