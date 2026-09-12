@@ -112,7 +112,10 @@ impl Registry {
         };
 
         // Load state
-        let state = load_state(local.path());
+        let mut state = load_state(local.path());
+        // A persisted readiness counter is not evidence that inherited files
+        // are intact. Reconcile nonempty inventories once after process open.
+        state.packs_revision = 0;
 
         let state_is_behind =
             state.applied_seq < manifest.head_seq || state.revision != manifest.revision;
@@ -141,6 +144,10 @@ impl Registry {
             crate::sync::apply_delta(&handle, &manifest, &manifest_version).await?;
         }
 
+        if manifest.packs.is_empty() {
+            let mut state = handle.state.lock();
+            state.packs_revision = state.revision;
+        }
         self.repos.insert(id.clone(), handle.clone());
         Ok(handle)
     }
@@ -234,7 +241,12 @@ impl Registry {
                 // Init local repo
                 let local = LocalRepo::init(&self.cache_root, id, format)?;
 
-                let state = RepoState::default();
+                let state = RepoState {
+                    manifest_version: Some(meta.version.as_str().to_string()),
+                    revision: manifest.revision,
+                    packs_revision: manifest.revision,
+                    ..Default::default()
+                };
                 save_state(local.path(), &state)?;
 
                 let handle = RepoHandle::new(

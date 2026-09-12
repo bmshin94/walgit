@@ -832,7 +832,9 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
                         let mut state = handle.state.lock();
                         state.manifest_version = Some(version.as_str().to_string());
                         state.applied_seq = committed.head_seq;
-                        let ready = state.packs_ready();
+                        let ready = state.packs_ready()
+                            && state.revision == manifest.revision
+                            && committed.revision == manifest.revision + 1;
                         state.revision = committed.revision;
                         if ready {
                             state.packs_revision = committed.revision;
@@ -1214,7 +1216,9 @@ pub(crate) async fn publish_compact_classified(
                         state.pending_pack_removals.push(s.clone());
                     }
                 }
-                let ready = state.packs_ready();
+                let ready = state.packs_ready()
+                    && state.revision == manifest.revision
+                    && committed.revision == manifest.revision + 1;
                 state.revision = committed.revision;
                 if ready {
                     state.packs_revision = committed.revision;
@@ -1481,8 +1485,14 @@ pub(crate) async fn publish_settings_impl(
                 {
                     let mut state = handle.state.lock();
                     state.manifest_version = Some(meta.version.as_str().to_string());
+                    let ready = state.packs_ready()
+                        && state.revision == manifest.revision
+                        && manifest.packs == updated.packs;
                     state.applied_seq = seq;
                     state.revision = updated.revision;
+                    if ready {
+                        state.packs_revision = updated.revision;
+                    }
                 }
                 crate::state::save_state(handle.local.path(), &handle.state.lock().clone())?;
                 *handle.effective.lock() = None;

@@ -63,21 +63,46 @@ required implementation obligation even while the corresponding Rust audit remai
 |---|---|---|---|
 | C2/C3, B5/B6 | Content-addressed coverage snapshots; committed checkpoint pointer; paired manifest/token/ref capture | SnapshotAuthority: guess/splice/cache; crossed/orphan witnesses. PublicationView: split capture | WAL coverage/checkpoint tests and serial simulation suite; further warm-race twins remain required |
 | C6b/C6c, B2 | Exact policy/member/dependency selection, shared snapshot budget, native splice and engine gates | PackCoverage: retire/scope/policy/dependency/generation/companion; retry/old/new/concurrent witnesses | `packfile_uri` selector tests; stock-Git SHA-1/SHA-256 filtered clone and checkout; native residual, metadata isolation and gix/protected fallback |
-| C6d/C10a | Exact captured inputs, conserving disk-spooled families, additive output commits and final seal | PackReplacement: raw/conserve/replace/supersedes; seal/refusal/race/retry witnesses. ClosureProvenance: boundary/tip/seal/retry/rival controls | `pack_segments` conservation/resume fixtures and WAL exact-seal tests; raw-boundary and per-attempt closure audit remains open |
+| C6d/C10a | Exact captured inputs, raw indexed-link validation in isolated inputs, conserving disk-spooled families, additive output commits and final seal | PackReplacement: raw/conserve/replace/supersedes; seal/refusal/race/retry witnesses. ClosureProvenance: boundary/tip/seal/retry/rival controls | `pack_segments` conservation/resume fixtures and WAL exact-seal tests; SHA-1/SHA-256 unreachable broken-link rejection and bounded metadata validation; per-attempt publication/seal closure audit remains open |
 | C2/C3 | Checkpoint anti-regression and composition against the current CAS basis | WALCheckpoint fixed/bug; ManifestComposition stale-base/no-checkpoint/no-tips and composite-story witnesses | Delayed-checkpoint test and simulation replay oracle; combined publisher/checkpointer/sealer twin remains required |
 | C5/C7/C8 | No-op receipts use seq 0 and publish no entry; empty-ref pack-only requests reject; unknown CAS remains typed unknown | BatchPublication: partial/isolation/retry/phantom/absence/noopphantom; atomic, late, folded and no-op witnesses | `noop_receipts_never_claim_a_siblings_log_entry`; `lost_cas_reply_is_resolved_or_unknown_without_losing_the_commit`; further late/overlaid failure twins remain required |
 | C3/C7, B5 | Per-claim nonce prevents content-token aliasing; lost-response resolution checks exact bytes | LogSlotClaim: burned retry/early sweep/ambiguous delete/deterministic bytes; retry/sweep/late witnesses | `recreated_claims_have_distinct_bytes_and_resolution_checks_identity`; orphan WAL and fault simulation tests; delayed-delete ABA twin remains required |
 | C9 | Disable redirects and transport retries; only pre-delivery failures permit local fallback | FrontReplay: ambiguous replay/connect taxonomy/no precondition/no-op publishing; fallback/recovery/quiet no-op witnesses | `ambiguous_delivery_and_gateway_responses_never_publish_locally`; no-op WAL receipt test |
 | C10b | Exact retired membership and retained bucket bytes | MCTrim: reader mutation and historical-trim witness | Protected retired pack/index download test; explicit pinned historical local-reader twin remains required |
 
+| C2/C3, B2 | Carry readiness only from an already-proven matching inventory; recheck revision-only changes after restart | ReadinessCarry: packs-only, no-carry, annotation/apply waste, stale opener, birth and empty-state controls | `readiness_carries_only_proven_inventory_and_rechecks_revision_only_restart` |
+| C7, B5/B6 | Validate index checksum, pack identity and count; replace damaged inodes and return opened mappings even after zero-download reuse | CacheDiscipline: presence/identity/reprove/fail-open/reader/sweep controls and rescue witnesses | `repairs_corrupt_and_wrong_identity_indexes_and_pins_old_readers` (both Git hash formats); publisher evidence integration remains required |
+| C10b | Attempt-owned temporary paths; cross-process kernel lock held by blocking workers through cancellation; reclaim only after acquiring that lock | TempReclaim: drop/sweep/dead-owner/interlock/age mutations; induction and ownership/recovery witnesses | `blocking_owner_keeps_lock_after_request_cancellation`; `killed_process_releases_ownership_before_residue_reclaim`; abandoned-temp recovery in the index test |
+
+### Cache abstraction boundaries
+
+CacheDiscipline is an obligation reference with separate probe, proof, repair and sweep windows. The public
+index cache serializes name operations across processes and returns mmap handles before releasing its lock;
+readers keep those handles across later removal. A stale sweep can discard a reusable name but cannot remove
+an active operation's unopened name. This is a different interlock from the model's atomic live-manifest
+sweep rule. The model does not establish a refinement of that lock or of future publisher evidence gates.
+
+TempReclaim models a PID registry with two processes and two lanes, including an inductive litter bound and
+its negative controls. Public index downloads instead use a kernel file lock and at most four concurrent
+attempts per repository cache. Blocking workers retain ownership after their async request is cancelled.
+Acquiring the lock permits reclaiming abandoned attempt names without age, PID reuse or namespace guesses.
+The reference's PID oracle and exact lane bound are not claims about this implementation. File count is not
+a byte-budget or eventual-reclamation proof; pack installation outside this index cache still needs its own
+cancellation/temporary-ownership audit. Both reference models retain their safety mutations and witnesses.
+
 ## Remaining scope and limits
 
-CacheDiscipline, TempReclaim and ReadinessCarry still require public-cache applicability review, corrections
-and concrete twins. PolicyPinLocality models policy blobs pinned to committed Git refs; this public tree uses
-`policy.json`, so that model cannot be presented as a proof of its policy protocol. Its applicability and any
-needed public-policy correction must be resolved explicitly before completing the port.
+Publisher cache-proof integration and cancellation/ownership auditing outside the remote index cache remain required.
+PolicyPinLocality and its 29 matrix arms are excluded: they require policy blobs addressed through a
+committed metadata ref, same-batch metadata writers and quarantine-backed policy resolution. This public
+tree loads `policy.json` once in `smart.rs` and saves it separately in `policy.rs`; none of those Git-policy
+operations exist. Importing that model would certify a different protocol. Concurrent policy-edit semantics
+are therefore not established by this packfile port; adding CAS-bound Git policy would be a separate design
+change. Per-submission independence remains covered by BatchPublication and its Rust receipt tests.
 
-Cold truncated-read readiness and seal-evidence cooldown remain open. Green model reruns do
+Small downloads now reject clean early EOF and oversized bodies, with a deterministic failed-download/retry
+test. This does not close the full cold truncated-read readiness boundary. That boundary and
+seal-evidence cooldown remain open. Green model reruns do
 not close either gap. Producer quarantine/import, namespace recreation, resource limits, a distributable
 protected URI client, live backend/edge tests and representative performance measurements are separate gates.
 No model proves authentication, pack encoding, index hashes or Git wire correctness; real regression tests

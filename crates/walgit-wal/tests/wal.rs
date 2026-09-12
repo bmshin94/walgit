@@ -2909,3 +2909,82 @@ async fn lost_cas_reply_is_resolved_or_unknown_without_losing_the_commit() {
     }
     assert_eq!(handle.read_log(1, None).await.unwrap().len(), 3);
 }
+
+#[tokio::test]
+async fn readiness_carries_only_proven_inventory_and_rechecks_revision_only_restart() {
+    let writer_cache = tempfile::tempdir().unwrap();
+    let reader_cache = tempfile::tempdir().unwrap();
+    let store = MemoryStore::shared();
+    let writer_registry =
+        Registry::new(store.clone(), Arc::new(make_config(writer_cache.path(), 0)));
+    let id = repo_id("o", "readiness");
+    let writer = writer_registry
+        .create(&id, ObjectFormat::Sha1)
+        .await
+        .unwrap();
+    assert!(
+        writer.packs_ready(),
+        "new empty inventory is proven at its birth revision"
+    );
+    let work = WorkRepo::new();
+    let tip = work.commit("first", "content");
+    let pack = ingest_pack_data(&writer, work.create_pack()).await.unwrap();
+    let checksum = pack.checksum;
+    writer
+        .publish_push(
+            Some(pack),
+            make_txn(vec![("refs/heads/main", "", &tip)]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+    assert!(writer.packs_ready());
+    let reader_registry =
+        Registry::new(store.clone(), Arc::new(make_config(reader_cache.path(), 0)));
+    let reader = reader_registry.open(&id).await.unwrap();
+    assert!(!reader.packs_ready());
+    drop(reader.sync().await.unwrap());
+    assert!(reader.packs_ready());
+    writer
+        .publish_settings("[packs]\nenabled = false\n", "test", "unchanged inventory")
+        .await
+        .unwrap();
+    assert!(
+        writer.packs_ready(),
+        "settings must not invent installation work"
+    );
+    drop(reader.sync_refs().await.unwrap());
+    assert!(
+        reader.packs_ready(),
+        "refs apply carries only an identical proven inventory"
+    );
+    drop(reader);
+    drop(reader_registry);
+    let seq = writer.manifest().head_seq;
+    let rev = writer.local().write_rev_index(&checksum).await.unwrap();
+    writer
+        .annotate_pack(&checksum.to_string(), Some(rev), None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        writer.manifest().head_seq,
+        seq,
+        "annotation changes revision without log sequence"
+    );
+    let reopened_registry = Registry::new(store, Arc::new(make_config(reader_cache.path(), 0)));
+    let reopened = reopened_registry.open(&id).await.unwrap();
+    assert!(
+        !reopened.packs_ready(),
+        "saved counters must not hide a new side file"
+    );
+    let local_rev = reopened.local().pack_path(&checksum).with_extension("rev");
+    assert!(!local_rev.exists());
+    drop(reopened.sync().await.unwrap());
+    assert!(reopened.packs_ready());
+    assert!(local_rev.is_file());
+    drop(reopened.sync().await.unwrap());
+    assert!(
+        reopened.packs_ready(),
+        "reconciliation must settle at the held revision"
+    );
+}

@@ -232,6 +232,7 @@ pub(crate) async fn link_and_install_pack(
     pack: &PackRef,
     tmp_dir: &std::path::Path,
     target: &std::path::Path,
+    reporter: &crate::progress::Reporter,
 ) -> Result<(), WalError> {
     let checksum = &pack.checksum;
     let oid = gix_hash::ObjectId::from_hex(checksum.as_bytes())
@@ -244,7 +245,6 @@ pub(crate) async fn link_and_install_pack(
     let idx_path = tmp_dir.join(format!("pack-{checksum}.idx"));
     // The remote reader may already hold this index (web API on the same
     // instance): same bytes, hard-link instead of a second 2 GB download.
-    let remote_idx = crate::remote::idx_dir(local.path()).join(format!("{checksum}.idx"));
     let mut extra = Vec::new();
     let mut side_futs = Vec::new();
     // Idx + rev + bitmap + commit-graph in one round (each already striped).
@@ -261,9 +261,14 @@ pub(crate) async fn link_and_install_pack(
                 .instrument(span.clone()),
         );
     }
-    let idx_r = if remote_idx.is_file()
-        && (std::fs::hard_link(&remote_idx, &idx_path).is_ok()
-            || std::fs::copy(&remote_idx, &idx_path).is_ok())
+    let idx_r = if crate::index_cache::reuse(
+        local.path(),
+        pack,
+        local.object_format().kind(),
+        idx_path.clone(),
+        reporter,
+    )
+    .await?
     {
         tracing::info!(checksum = %checksum, "pack index reused from the remote reader");
         let side_rs = futures::future::join_all(side_futs).await;
@@ -331,6 +336,34 @@ fn nonzero(n: u64) -> Option<u64> {
     (n > 0).then_some(n)
 }
 
+async fn write_complete_body(
+    key: &str,
+    dest: &std::path::Path,
+    mut body: walgit_store::ByteStream,
+    size: u64,
+    report: &(impl Fn(u64) + Sync),
+) -> Result<(), WalError> {
+    use futures::StreamExt;
+    let mut received = 0u64;
+    let mut file = tokio::fs::File::create(dest).await?;
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk?;
+        received = received.saturating_add(chunk.len() as u64);
+        if received > size {
+            return Err(WalError::Corrupt(format!("oversized body for {key}")));
+        }
+        tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await?;
+        report(chunk.len() as u64);
+    }
+    if received != size {
+        return Err(WalError::Corrupt(format!(
+            "short body for {key}: expected {size}, got {received}"
+        )));
+    }
+    tokio::io::AsyncWriteExt::flush(&mut file).await?;
+    Ok(())
+}
+
 pub(crate) async fn download_object(
     store: &Prefixed,
     key: &str,
@@ -365,16 +398,14 @@ pub(crate) async fn download_object(
     if size <= CHUNK {
         let res = store.get(key, GetOptions::default()).await?;
         return match res {
-            GetResult::Object { body, .. } => {
-                let mut file = tokio::fs::File::create(dest).await?;
-                let mut body = body;
-                while let Some(chunk) = body.next().await {
-                    let chunk = chunk?;
-                    tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await?;
-                    report(chunk.len() as u64);
+            GetResult::Object { meta, body } => {
+                if meta.size != size {
+                    return Err(WalError::Corrupt(format!(
+                        "size changed for {key}: expected {size}, got {}",
+                        meta.size
+                    )));
                 }
-                tokio::io::AsyncWriteExt::flush(&mut file).await?;
-                Ok(())
+                write_complete_body(key, dest, body, size, &report).await
             }
             GetResult::NotModified { .. } => {
                 Err(WalError::Corrupt(format!("unexpected 304 for {key}")))
@@ -476,8 +507,15 @@ pub(crate) async fn apply_delta(
     {
         let mut state = handle.state.lock();
         state.manifest_version = Some(new_version.as_str().to_string());
+        let held = handle.manifest();
+        let ready = state.packs_ready()
+            && state.revision == held.revision
+            && held.packs == new_manifest.packs;
         state.applied_seq = head_seq;
         state.revision = new_manifest.revision;
+        if ready {
+            state.packs_revision = new_manifest.revision;
+        }
     }
     crate::state::save_state(local.path(), &handle.state.lock().clone())?;
     local.refresh_async().await?;
@@ -722,7 +760,8 @@ pub(crate) async fn reconcile_packs_inner(
                 };
                 match link_to {
                     Some(target) => {
-                        link_and_install_pack(&store, &local, &p, &tmp_dir, &target).await
+                        link_and_install_pack(&store, &local, &p, &tmp_dir, &target, &reporter)
+                            .await
                     }
                     None => {
                         download_and_install_pack(&store, &local, &p, &tmp_dir, Some(&cb)).await
@@ -1103,6 +1142,30 @@ pub(crate) async fn on_bulk_runtime<T: Send + 'static>(
 mod download_tests {
     use super::download_object;
     use walgit_store::{ObjectStoreExt, Prefixed, PutMode, memory::MemoryStore};
+
+    #[tokio::test]
+    async fn clean_early_eof_is_rejected_and_retry_replaces_partial_bytes() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let dest = dir.path().join("download.tmp");
+        let body = |bytes: &'static [u8]| -> walgit_store::ByteStream {
+            Box::pin(futures::stream::once(async move {
+                Ok(bytes::Bytes::from_static(bytes))
+            }))
+        };
+        assert!(
+            super::write_complete_body("pack", &dest, body(b"short"), 8, &|_| {})
+                .await
+                .is_err()
+        );
+        assert!(
+            super::write_complete_body("pack", &dest, body(b"too many bytes"), 8, &|_| {})
+                .await
+                .is_err()
+        );
+        super::write_complete_body("pack", &dest, body(b"complete"), 8, &|_| {}).await?;
+        assert_eq!(std::fs::read(&dest)?, b"complete");
+        Ok(())
+    }
 
     #[tokio::test]
     async fn striped_download_matches_source() {

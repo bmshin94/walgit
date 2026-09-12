@@ -88,6 +88,12 @@ fn plan_blocking(
     if resources.sort_memory_bytes == 0 {
         return Err(invalid("positive sort budget required"));
     }
+    crate::object_links::verify_indexed_links(
+        &input.repo,
+        &input.packs,
+        &input.refs,
+        resources.sort_memory_bytes,
+    )?;
     let groups = resolve_groups(refs, &RefSnapshotData::from(input.refs.clone()))?;
     let work = tempfile::Builder::new()
         .prefix("segment-work-")

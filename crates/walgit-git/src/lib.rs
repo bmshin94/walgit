@@ -6,6 +6,7 @@
 pub mod follow;
 pub mod maintenance_input;
 pub mod midx;
+pub mod object_links;
 pub mod pack_groups;
 pub mod pack_segments;
 pub mod packfile_uri;
