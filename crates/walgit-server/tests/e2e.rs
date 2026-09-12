@@ -2382,6 +2382,7 @@ async fn reads_after_an_acknowledged_push_never_show_the_previous_tip() -> TestR
         assert!(!base.is_empty());
         // 6 contenders from the same base, each with its own commit.
         let mut handles = Vec::new();
+        let start_pushes = std::sync::Arc::new(std::sync::Barrier::new(7));
         for i in 0..6 {
             let d = tempfile::tempdir()?;
             git(
@@ -2397,10 +2398,12 @@ async fn reads_after_an_acknowledged_push_never_show_the_previous_tip() -> TestR
             let sha = git_in(d.path(), &["rev-parse", "HEAD"])?.trim().to_string();
             let url2 = url.clone();
             let cwd = d.path().to_path_buf();
+            let start = start_pushes.clone();
             handles.push((
                 d,
                 sha,
                 std::thread::spawn(move || {
+                    start.wait();
                     // true when this push won
                     let o = std::process::Command::new("git")
                         .current_dir(&cwd)
@@ -2435,12 +2438,17 @@ async fn reads_after_an_acknowledged_push_never_show_the_previous_tip() -> TestR
             }
             seen
         });
+        // Every clone and commit exists before any contender may publish.
+        start_pushes.wait();
         let mut winner = None;
+        let mut winners = 0;
         for (_d, sha, h) in handles {
             if h.join().unwrap() {
+                winners += 1;
                 winner = Some(sha);
             }
         }
+        assert_eq!(winners, 1, "exactly one same-base push wins each round");
         let winner = winner.expect("exactly one push wins each round");
         // Read-your-writes: the first read after the last push returned must be the winner, and so
         // must every read after it.
