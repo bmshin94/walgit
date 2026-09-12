@@ -77,7 +77,7 @@ and concrete twins. PolicyPinLocality models policy blobs pinned to committed Gi
 `policy.json`, so that model cannot be presented as a proof of its policy protocol. Its applicability and any
 needed public-policy correction must be resolved explicitly before completing the port.
 
-Cold truncated-read readiness (WGI-14) and seal-evidence cooldown (WGI-16) remain open. Green model reruns do
+Cold truncated-read readiness and seal-evidence cooldown remain open. Green model reruns do
 not close either gap. Producer quarantine/import, namespace recreation, resource limits, a distributable
 protected URI client, live backend/edge tests and representative performance measurements are separate gates.
 No model proves authentication, pack encoding, index hashes or Git wire correctness; real regression tests
