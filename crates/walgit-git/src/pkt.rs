@@ -270,6 +270,9 @@ pub async fn read_command<R: AsyncRead + Unpin>(mut r: R) -> Result<(V2Command, 
                     cmd.name = rest.to_string();
                     saw_name = true;
                 } else if let Some((k, v)) = s.split_once('=') {
+                    if k == "server-option" {
+                        cmd.args.push(s.clone());
+                    }
                     cmd.caps.insert(k.to_string(), v.to_string());
                 } else {
                     // Could be a capability ("thin-pack") or a positional arg.

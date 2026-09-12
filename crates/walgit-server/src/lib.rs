@@ -47,6 +47,7 @@ pub mod metrics;
 pub mod middleware;
 pub mod ops;
 pub mod pack_lifecycle;
+pub mod packfile_uri;
 pub mod pktline;
 pub mod policy;
 pub mod prewarm;
@@ -363,6 +364,9 @@ pub(crate) async fn dispatch_route(
     let sub = route.subpath.as_str();
     let result: Result<Response, ApiError> = async {
         match (&method, sub) {
+            (&Method::GET | &Method::HEAD, s) if s.starts_with("packfiles/") => {
+                packfile_uri::get(st, route, &method, &headers, peer).await
+            }
             (&Method::GET, "info/refs") => {
                 let _permit = acquire(st, route).await;
                 smart::info_refs(st, route, &headers, &query).await

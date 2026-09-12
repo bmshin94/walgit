@@ -16,6 +16,14 @@ pub struct PublicationView {
     pub config: Arc<walgit_config::Config>,
 }
 
+/// A request's already-synced manifest and name-indexed refs, captured together.
+/// Unlike producer snapshots, this does not materialize the full current ref list.
+pub struct FetchView {
+    pub manifest: Arc<Manifest>,
+    pub refs: walgit_git::RefView,
+    pub config: Arc<walgit_config::Config>,
+}
+
 /// Uploaded candidate. It acquires authority only when a manifest CAS names it.
 #[derive(Clone, Debug)]
 pub struct CoverageSnapshot {
@@ -144,6 +152,44 @@ pub(crate) async fn checkpoint_snapshot(
 }
 
 impl RepoHandle {
+    pub async fn fetch_view(&self) -> Result<FetchView, WalError> {
+        let _sync = self.sync_mutex.lock().await;
+        let manifest = self.manifest();
+        let local = self.local.clone();
+        let refs = tokio::task::spawn_blocking(move || local.ref_view())
+            .await
+            .map_err(|e| WalError::Corrupt(e.to_string()))??;
+        let config = self.validated_config_for_manifest(&manifest)?;
+        Ok(FetchView {
+            manifest,
+            refs,
+            config,
+        })
+    }
+
+    /// Read exactly the descriptor in the request's captured manifest. Never
+    /// search a newer manifest by sequence or substitute another candidate key.
+    pub async fn read_coverage_snapshot(
+        &self,
+        view: &FetchView,
+        key: &str,
+        seq: u64,
+    ) -> Result<RefSnapshot, WalError> {
+        if view.manifest.repo != self.id.to_string()
+            || !view
+                .manifest
+                .packs
+                .iter()
+                .flat_map(|p| &p.group_coverages)
+                .any(|p| p.refs_key == key && p.covers_seq == seq)
+        {
+            return Err(WalError::Invalid(
+                "snapshot is outside captured coverage authority".into(),
+            ));
+        }
+        read_snapshot(&self.store, key, seq, &view.manifest.object_format).await
+    }
+
     /// Revalidate and capture one committed manifest/token/refs/policy view.
     /// No pack materialization, and no refs lock survives the returned value.
     pub async fn publication_view(&self) -> Result<PublicationView, WalError> {

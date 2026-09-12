@@ -6,6 +6,40 @@ bundle runtime; the group, proof, lifecycle, and URI mechanisms below are not ce
 Implementation and test receipts must accompany each later review unit. See [migration](PACKFILE_MIGRATION.md)
 for rollout gates and [round trips](ROUNDTRIPS.md) for the existing cost contract.
 
+## Implemented transport and remaining gates
+
+The native v2 path can deliver ordinary packs to anonymous-read clients that negotiate `http` or `https`
+packfile URIs. Exact current-policy certificates, live members and complete same-generation dependencies
+select a captured baseline; native Git sends the uncovered graph with thin-pack disabled. URI and optional
+index sections precede `packfile`, and synthetic-have ACKs are suppressed. Gix/remote engines stay dynamic.
+Protected clients stay dynamic until a distributable authenticated client is independently qualified;
+an index opt-in flag alone does not satisfy that release gate.
+
+`GET|HEAD /{owner}/{repo}[.git]/packfiles/{checksum}.pack` and `.idx` require ordinary read authorization
+and freshly revalidated live/retired manifest membership before conditional responses or byte offload.
+Protected responses use private immutable caching; optional loopback edge offload still requires admission
+on each request. Retired membership and bytes do not expire. No `.rev` delivery exists.
+
+The `packfile-indexes` fetch argument explicitly opts into an additional section containing
+`<pack-hash> <index-hash> <index-URL>`. Missing local index trailers omit that sidecar. This server framing
+does not qualify a trusted-index client: it must separately verify index hash, pack mapping, object count,
+header and integrity/trust settings. Stock clients do not request this extension.
+
+Selection shares at most three exact snapshot reads per request; the ordinary successful selection reads
+one snapshot. Threshold selection requires one worthwhile pack and retains small required companions,
+or falls back when the complete set exceeds the URI count cap. URLs sort by descending pack size then
+checksum. Shallow requests, unsupported filters, have-only negotiation, unknown wants, tag-only baselines
+without branch roots, and missing evidence remain dynamic. `blob:none` delivery selects proven history
+members only; it cannot treat mixed object packs as history. No optimal-cost or zero-extra-read claim is made.
+
+Default discovery follows `[refs].advertise`, independently of packing policy. For v2 mirror/backup tools
+that need every ordinary ref, use `git clone --mirror --server-option=ref-view=all <URL>` (and pass the same
+server option on later fetches). V0 follows the configured advertisement selectors; configure `refs/*`
+when full v0 discovery is required. Receive-pack advertisements remain complete.
+
+Model-to-code coverage, backend/edge validation, broader producer races and representative resource/performance
+acceptance remain separate release gates. Small stock-Git fixtures do not certify large-repository behavior.
+
 ## 1. One repository inventory
 
 The object-store bucket remains the repository. Immutable ordinary Git packs, committed WAL entries,

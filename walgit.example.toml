@@ -219,5 +219,3 @@ subtract = []
 [packfile_uri]
 uri_min_bytes = "32MiB"           # at least one useful pack; smaller required companions may accompany it
 max_uris_per_fetch = 64           # complete sets only; over-cap selections fall back dynamically
-refuse_packfile_incompatible_git = true
-refuse_unbounded_clone_without_uris = false # ordinary compatible clients retain dynamic fallback

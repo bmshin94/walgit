@@ -1189,6 +1189,7 @@ async fn test_serve_level_links_base_from_store_mount() {
                 shallow: vec![],
                 want_refs: vec![],
                 packfile_uris_protocols: vec![],
+                packfile_indexes: false,
             },
             &mut out,
         )
@@ -1555,6 +1556,7 @@ async fn test_serve_level_remote_serves_base_without_mount() {
                 shallow: vec![],
                 want_refs: vec![],
                 packfile_uris_protocols: vec![],
+                packfile_indexes: false,
             },
             &mut out,
             Some(&faulter),
@@ -1938,6 +1940,7 @@ async fn test_history_pack_keeps_tree_walks_local() {
         shallow: vec![],
         want_refs: vec![],
         packfile_uris_protocols: vec![],
+        packfile_indexes: false,
     };
     let mut out = Vec::new();
     let stats = handle2

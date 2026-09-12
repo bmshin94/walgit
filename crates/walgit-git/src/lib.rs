@@ -8,6 +8,7 @@ pub mod maintenance_input;
 pub mod midx;
 pub mod pack_groups;
 pub mod pack_segments;
+pub mod packfile_uri;
 pub mod pkt;
 pub mod receive;
 pub mod repair;
@@ -428,7 +429,7 @@ impl Service {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 #[expect(
     clippy::struct_excessive_bools,
     reason = "Independent Git protocol capabilities and request flags"
@@ -450,6 +451,7 @@ pub struct UploadPackRequest {
     pub shallow: Vec<gix_hash::ObjectId>,
     pub want_refs: Vec<String>,
     pub packfile_uris_protocols: Vec<String>,
+    pub packfile_indexes: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1925,8 +1927,20 @@ impl LocalRepo {
 
     /// v0 advertisement with capabilities. The HTTP server prepends the
     /// `# service=<svc>\n` pkt-line + flush.
-    pub fn advertise_refs_v0(&self, service: Service, out: &mut Vec<u8>) -> Result<(), GitError> {
-        let snap = self.refs()?;
+    pub fn advertise_refs_v0(
+        &self,
+        service: Service,
+        out: &mut Vec<u8>,
+        selectors: Option<&[String]>,
+    ) -> Result<(), GitError> {
+        let mut snap = self.refs()?;
+        if service == Service::UploadPack
+            && let Some(selectors) = selectors
+        {
+            snap.refs.retain(|r| {
+                walgit_config::refs::selectors_match(selectors, &r.name, &snap.head_target)
+            });
+        }
         let caps = capabilities_for(service, self.inner.format);
         let caps_line = format!("\0{caps}\n");
 
@@ -3132,6 +3146,15 @@ fn peel_tag(repo: &gix::Repository, oid: gix_hash::ObjectId) -> Option<gix_hash:
 pub fn build_v2_fetch_request(req: &UploadPackRequest) -> Vec<u8> {
     let mut buf = Vec::new();
     pkt::encode_data(&mut buf, b"command=fetch\n");
+    if req
+        .wants
+        .first()
+        .or(req.haves.first())
+        .or(req.shallow.first())
+        .is_some_and(|oid| oid.kind() == gix_hash::Kind::Sha256)
+    {
+        pkt::encode_data(&mut buf, b"object-format=sha256\n");
+    }
     // Git protocol v2 carries all fetch features (thin-pack, want, have, ...)
     // as arguments following the delim-pkt; there is no pre-delim capability
     // section for fetch.
@@ -3179,7 +3202,7 @@ pub fn build_v2_fetch_request(req: &UploadPackRequest) -> Vec<u8> {
         pkt::encode_data(&mut buf, format!("want-ref {r}\n").as_bytes());
     }
     if !req.packfile_uris_protocols.is_empty() {
-        let joined = req.packfile_uris_protocols.join(" ");
+        let joined = req.packfile_uris_protocols.join(",");
         pkt::encode_data(&mut buf, format!("packfile-uris {joined}\n").as_bytes());
     }
     if req.done {

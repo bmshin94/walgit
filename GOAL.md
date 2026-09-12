@@ -25,8 +25,8 @@ anyone can run against a bucket, and predictable enough that tooling can build o
    refs in < 1 s cold, web pages in ~100 ms, CI's `clone --filter=blob:none --depth=1 --sparse --single-branch`
    in seconds, a developer's `git fetch` in the time it takes to read the output, fresh clones and stale fetches using negotiated reusable packs so bulk bytes can move directly to clients.
    **Fast clone and catch-up through proved static packs is the north star**
-   ([design target](docs/PACKFILE_URI_DESIGN.md)). The bundle-removal phase retains dynamic upload-pack;
-   the packfile architecture and its scale acceptance remain to be implemented and measured.
+   ([design and current scope](docs/PACKFILE_URI_DESIGN.md)). Native anonymous-read delivery is implemented;
+   protected-client qualification and scale acceptance remain to be established and measured.
 4. **All the features a git host needs, and only those**: smart HTTP v0/v2 (ls-refs, fetch with
    filter/shallow/deepen, receive-pack atomic/delete/tags/push-options/report-status-v2), negotiated packfile delivery, LFS,
    `<owner>/<repo>` namespaces, per-repo push policy and settings, ref events, a browsing web UI + one JSON API +

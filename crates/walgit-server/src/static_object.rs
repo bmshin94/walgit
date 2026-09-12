@@ -140,13 +140,9 @@ fn if_none_match_hit(headers: &HeaderMap, version: &Version) -> bool {
 /// range is ignored and the full body is sent (RFC 9110 §13.1.5). Dates are
 /// not supported (we have no `Last-Modified`) and therefore also ignored.
 fn if_range_allows(headers: &HeaderMap, version: &Version) -> bool {
-    match headers.get(header::IF_RANGE).and_then(|v| v.to_str().ok()) {
+    match headers.get(header::IF_RANGE) {
         None => true,
-        Some(v) if v.contains('"') => {
-            v.trim().trim_start_matches("W/").trim_matches('"')
-                == version.as_str().trim_matches('"')
-        }
-        Some(_) => false,
+        Some(value) => value.to_str().is_ok_and(|v| v.trim() == etag_of(version)),
     }
 }
 
@@ -464,6 +460,10 @@ mod tests {
         h.insert(header::IF_RANGE, HeaderValue::from_static("\"123\""));
         assert!(if_range_allows(&h, &Version::new("123")));
         assert!(!if_range_allows(&h, &Version::new("124")));
+        for value in ["W/\"123\"", "123", "\"\"123\"\"", "\"123\", \"124\""] {
+            h.insert(header::IF_RANGE, HeaderValue::from_str(value).unwrap());
+            assert!(!if_range_allows(&h, &Version::new("123")), "{value}");
+        }
         h.insert(
             header::IF_RANGE,
             HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),

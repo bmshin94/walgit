@@ -25,7 +25,7 @@ pub use progress::{Progress, Reporter};
 pub use publish::PublishResult;
 pub use registry::{EvictReport, Registry};
 pub use remote::{BlockCache, RemotePacks};
-pub use snapshots::{CoverageSnapshot, PublicationView, validate_manifest};
+pub use snapshots::{CoverageSnapshot, FetchView, PublicationView, validate_manifest};
 pub use sync::{PackPlan, ReadGuard, SyncLevel};
 pub use tasks::{Begin, TaskHandle, TaskRecord, Tasks};
 

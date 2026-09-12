@@ -218,10 +218,11 @@ subtracted root, with complete same-generation dependencies and live checks on e
 stays outside normal code delivery; retained indexed objects survive maintenance. Static URLs require read
 authorization plus exact live/retired membership. Retired downloads do not expire arbitrarily.
 
-The removal phase does not wire this system: native and gix fetch remain dynamic. Later changes must implement
-conserving fold/freeze/re-segmentation, safe native URI framing and engine guards, bounded costs, stock-client
-fallback and separately verified protected-client support. Never subtract synthetic haves on a path that does
-not emit their URLs. See [migration gates](docs/PACKFILE_MIGRATION.md) before changing durable writers.
+The native v2 path delivers proven URI packs for anonymous-read clients; gix/remote engines stay dynamic.
+Protected clients retain dynamic fallback pending independent authenticated-client qualification. Discovery
+uses `refs.advertise`; v2 mirrors request `server-option=ref-view=all` for complete ordinary refs. Static pack
+and index GET/HEAD require read auth and fresh live/retired membership. Never subtract synthetic haves on a
+path that does not emit their URLs. See [migration gates](docs/PACKFILE_MIGRATION.md) before changing durable writers.
 
 ### 2.7 Tasks, progress, narration (`walgit-wal/src/tasks.rs`, `crates/walgit-server/src/sse.rs`, `smart.rs`)
 Any long work = a task: unique id, per-instance log (`GET …/tasks`), `(repo, kind)` lock (a second start joins),
@@ -441,6 +442,17 @@ Unrelated constraints remain in force. The current design target and migration g
   eligibility still requires exact code-group proof. Scratch receipts and locks cannot establish
   durable authority. This layer does not certify negotiated delivery, protected clients, model
   refinement, or large-repository resource/performance acceptance.
+
+- **D46 (2026-09-12): Native URI delivery and discovery have separate gates.** Normal discovery uses
+  `refs.advertise`; explicit v2 `ref-view=all` preserves mirror/backup access to ordinary auxiliary refs.
+  Receive-pack remains complete. Only native Git may subtract selected roots; gix and remote dispatch happen
+  first and remain dynamic. Selection uses exact captured certificates and one shared three-snapshot budget;
+  size/count limits cannot discard required companions. URI encoding is non-thin. Static pack/index routes
+  revalidate live/retired membership after ordinary read auth, and protected responses use private caching.
+  `packfile-indexes` is an explicit optional wire extension, not proof of authenticated-client compatibility.
+  Protected dynamic fallback remains until a distributable client is qualified. No version-label heuristic,
+  anonymous exposure of protected packs, `.rev` transfer, arbitrary-want coverage guess or full-clone refusal
+  knob is introduced. Large narrated dynamic clones warn. Scale and model/code mapping gates remain open.
 
 Decision identifiers are stable; gaps in the numbering are intentional.
 
