@@ -101,8 +101,8 @@ are therefore not established by this packfile port; adding CAS-bound Git policy
 change. Per-submission independence remains covered by BatchPublication and its Rust receipt tests.
 
 Small downloads now reject clean early EOF and oversized bodies, with a deterministic failed-download/retry
-test. This does not close the full cold truncated-read readiness boundary (WGI-14). That boundary and
-seal-evidence cooldown (WGI-16) remain open. Green model reruns do
+test. This does not close the full cold truncated-read readiness boundary. That boundary and
+seal-evidence cooldown remain open. Green model reruns do
 not close either gap. Producer quarantine/import, namespace recreation, resource limits, a distributable
 protected URI client, live backend/edge tests and representative performance measurements are separate gates.
 No model proves authentication, pack encoding, index hashes or Git wire correctness; real regression tests
