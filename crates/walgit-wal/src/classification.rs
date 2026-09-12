@@ -1,5 +1,6 @@
 //! Metadata publication for already committed packs. Graph closure/conservation
-//! must be proved by the producer; these guards validate the authority structure.
+//! starts with the producer; final retirement also verifies indexed conservation
+//! and current-tip membership against each captured CAS basis.
 use crate::{CoverageSnapshot, RepoHandle, WalError};
 use prost::Message;
 use std::collections::{BTreeMap, BTreeSet};
@@ -365,7 +366,8 @@ impl RepoHandle {
 impl RepoHandle {
     /// Complete a conserving multi-output replacement. Outputs must already be
     /// committed; until this CAS, all original inputs remain live. The producer
-    /// verifies indexed-object conservation before calling this metadata seal.
+    /// validates raw links; the seal independently checks indexed conservation
+    /// and all captured current tips before each CAS attempt.
     pub async fn seal_pack_replacement(
         &self,
         captured: &crate::PublicationView,
@@ -403,8 +405,9 @@ impl RepoHandle {
                 .heartbeat(captured.config.packs.lease_ttl)
                 .await
                 .map_err(|e| invalid(format!("replacement lease: {e}")))?;
-            self.sync_impl_level(crate::SyncLevel::Refs).await?;
-            let (current, version) = self.manifest_pair();
+            let view = self.publication_view().await?;
+            let current = view.manifest;
+            let version = view.version;
             let cfg = self.validated_config_for_manifest(&current)?;
             if cfg.refs.policy_identity() != captured.config.refs.policy_identity() {
                 return Err(invalid("packing policy changed during replacement"));
@@ -471,6 +474,10 @@ impl RepoHandle {
             updated.packs.retain(|p| !retire.contains(&p.checksum));
             prune_invalid_coverages(&mut updated, &cfg, &output_ids);
             validate_certificates(self, &current, &updated, &output_ids, snapshots).await?;
+            crate::closure::verify_replacement_inventory(
+                self, &current, &updated, &view.refs, inputs, outputs,
+            )
+            .await?;
             let at = time::now();
             let slot = match claim_log_slot(&self.store, current.head_seq, |seq| {
                 let entry = LogEntry {

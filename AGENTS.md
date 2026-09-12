@@ -480,6 +480,13 @@ open, including manifest changes that advance revision without adding a log entr
 short or oversized bodies. These checks do not replace the required per-CAS closure proof or establish the
 full cold-read/resource acceptance gates listed in `docs/spec/README.md`.
 
+- **D49 (2026-09-12): Final retirement re-proves indexed conservation.** Capture manifest/token/refs
+  together on every seal attempt, verify the exact current indexes, and merge input/output OID streams
+  with one cursor per pack. Every indexed input object must survive in the declared outputs, and every
+  current tip must appear in the resulting live inventory before the log claim/CAS. Raw producer admission
+  and candidate external-boundary proof remain separate obligations; local loose objects and retired
+  download membership cannot justify retirement. See the cost and remaining-evidence rows in the linked docs.
+
 ## 5. Working rules
 
 - **No backwards compatibility (pre-1.0, banner at top):** change the shape and delete the old one in the same

@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::field_reassign_with_default)]
-//! Authority tests use small manifest fixtures: graph closure is a producer
-//! obligation, separate from these publication and snapshot protocol guards.
+//! Authority tests use small manifest fixtures. Retirement tests also use real
+//! Git indexes to exercise conservation independently of producer assertions.
 use prost::Message;
 use std::sync::Arc;
 use walgit_config::{Config, PackGroupConfig, PackGroupKind};
@@ -70,6 +70,104 @@ fn classify(
     }
 }
 
+async fn real_pack(store: &Arc<MemoryStore>, blobs: &[&str]) -> PackRef {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let dir = tempfile::tempdir().unwrap();
+    let run = |args: &[&str], input: &str| {
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    run(&["init", "--bare"], "");
+    let objects = blobs
+        .iter()
+        .map(|blob| run(&["hash-object", "-w", "--stdin"], blob))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let checksum = run(
+        &["pack-objects", "objects/pack/pack"],
+        &format!("{objects}\n"),
+    );
+    let pack = std::fs::read(
+        dir.path()
+            .join(format!("objects/pack/pack-{checksum}.pack")),
+    )
+    .unwrap();
+    let index =
+        std::fs::read(dir.path().join(format!("objects/pack/pack-{checksum}.idx"))).unwrap();
+    let descriptor = PackRef {
+        checksum: checksum.clone(),
+        pack_size: pack.len() as u64,
+        idx_size: index.len() as u64,
+        object_count: blobs.len() as u64,
+        ..Default::default()
+    };
+    for (ext, bytes) in [("pack", pack), ("idx", index)] {
+        store
+            .put_bytes(
+                &format!("{}wal/{checksum}.{ext}", id().store_prefix()),
+                bytes,
+                PutMode::Overwrite,
+            )
+            .await
+            .unwrap();
+    }
+    descriptor
+}
+
+// Seed an exact committed checkpoint, including intentionally damaged ref
+// provenance, without using the publication API whose admission is under test.
+async fn seed_next_refs(store: &Arc<MemoryStore>, h: &RepoHandle, refs: Vec<Ref>) {
+    let mut manifest = (*h.manifest()).clone();
+    let seq = manifest.head_seq + 1;
+    let snapshot = RefSnapshot {
+        seq,
+        object_format: "sha1".into(),
+        refs,
+        ..Default::default()
+    };
+    let refs_key = format!("checkpoints/{seq}/refs.pb");
+    store
+        .put_bytes(
+            &format!("{}{refs_key}", id().store_prefix()),
+            snapshot.encode_to_vec(),
+            PutMode::Create,
+        )
+        .await
+        .unwrap();
+    manifest.head_seq = seq;
+    manifest.min_seq = seq + 1;
+    manifest.log_segments.clear();
+    manifest.revision += 1;
+    manifest.checkpoint = Some(CheckpointRef {
+        seq,
+        key: format!("checkpoints/{seq}/checkpoint.pb"),
+        refs_key,
+        ..Default::default()
+    });
+    seed(store, &manifest).await;
+}
+
 #[tokio::test]
 async fn replacement_seal_requires_exact_outputs_and_keeps_inputs_until_success() {
     let store = MemoryStore::shared();
@@ -78,12 +176,8 @@ async fn replacement_seal_requires_exact_outputs_and_keeps_inputs_until_success(
     let h = registry.create(&id(), ObjectFormat::Sha1).await.unwrap();
     h.publish_settings("", "test", "generation").await.unwrap();
     let mut manifest = (*h.manifest()).clone();
-    let mut input = pack(1);
-    input.pack_size = 100;
-    let mut output = pack(2);
-    output.pack_size = 80;
-    output.idx_size = 40;
-    output.object_count = 3;
+    let input = real_pack(&store, &["conserved"]).await;
+    let mut output = real_pack(&store, &["conserved", "extra"]).await;
     output.published_at = Some(walgit_proto::time::now());
     output.pack_groups = vec!["_retained".into()];
     output.audience = PackAudience::Retained as i32;
@@ -126,11 +220,52 @@ async fn replacement_seal_requires_exact_outputs_and_keeps_inputs_until_success(
             .any(|p| p.checksum == input.checksum)
     );
     assert!(h.manifest().retired_packs.is_empty());
+    // Even plausible descriptors and already-committed bytes cannot justify
+    // dropping an unreachable indexed object from the captured input.
+    let lossy = real_pack(&store, &["unrelated"]).await;
+    manifest.packs.push(lossy.clone());
+    manifest.revision += 1;
+    seed(&store, &manifest).await;
+    let error = h
+        .seal_pack_replacement(
+            &captured,
+            &inputs,
+            std::slice::from_ref(&lossy),
+            &[],
+            &lease,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("loses indexed object"),
+        "{error}"
+    );
+    assert!(h.manifest().retired_packs.is_empty());
+    seed_next_refs(
+        &store,
+        &h,
+        vec![Ref {
+            name: "refs/heads/new-after-plan".into(),
+            oid: "a".repeat(40),
+            ..Default::default()
+        }],
+    )
+    .await;
+    let error = h
+        .seal_pack_replacement(&captured, &inputs, &[output.clone()], &[], &lease)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("does not cover current tip"),
+        "{error}"
+    );
+    assert!(h.manifest().retired_packs.is_empty());
+    seed_next_refs(&store, &h, vec![]).await;
     let seq = h
         .seal_pack_replacement(&captured, &inputs, &[output.clone()], &[], &lease)
         .await
         .unwrap();
-    assert_eq!(h.manifest().packs, vec![output.clone()]);
+    assert_eq!(h.manifest().packs, vec![output.clone(), lossy]);
     assert!(
         h.manifest()
             .retired_packs
