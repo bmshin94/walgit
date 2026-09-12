@@ -511,7 +511,7 @@ full cold-read/resource acceptance gates listed in `docs/spec/README.md`.
 - Web: pnpm + Vite, `pnpm run build` must pass oxlint/tsc. Config: `walgit.example.toml` documents every key;
   change it with the code.
 - Test tiers: `just test` (fast, < 1 min), `just e2e`, `just warnings`, `just clippy` (the
-  `[workspace.lints]` set, `-D warnings`), `just ci` = all four; the **simulation
+  `[workspace.lints]` set, `-D warnings`), `just ci` = all four plus `just sim` and `just smoke`; the **simulation
   suite** `cargo test -p walgit-server --test sim` (fault links per instance over one truth store: crash,
   partition, stale, lost response, orphan scenarios + randomized seeds `WALGIT_SIM_SEEDS`/`WALGIT_SIM_SEED`);
   `just test-slow` (ignored benches); `tests/e2e.sh` against a running server (`WALGIT_E2E_BASE_URL`,
