@@ -3,6 +3,7 @@
 
 mod checkpoint;
 mod classification;
+mod closure;
 mod error;
 mod handle;
 mod index_cache;
