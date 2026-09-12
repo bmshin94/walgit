@@ -805,9 +805,9 @@ pub async fn receive_pack(
         .await;
     }
 
-    // Bodies no larger than the configured replay buffer can safely fall back
-    // to local publish. Larger (or chunked/unknown-length) bodies stay fully
-    // streaming; if the broker fails, return 503 rather than double-publish.
+    // Buffering preserves a body, not permission to replay it. Only proven
+    // pre-delivery failure permits local fallback; ambiguous delivery never does.
+    // Larger (or unknown-length) requests stay fully streaming.
     let already_forwarded = headers
         .get("x-walgit-forwarded")
         .and_then(|v| v.to_str().ok())
@@ -853,6 +853,13 @@ pub async fn receive_pack(
         .await
         {
             crate::forward::ForwardOutcome::Response(response) => return Ok(response),
+            crate::forward::ForwardOutcome::Ambiguous => {
+                return Ok((
+                    StatusCode::BAD_GATEWAY,
+                    "push broker response lost; outcome unknown; inspect remote refs before retrying",
+                )
+                    .into_response());
+            }
             crate::forward::ForwardOutcome::Fallback => {
                 if let Some(bytes) = fallback_bytes {
                     metrics::counter!("walgit_push_forwarded_total", "outcome" => "fallback")

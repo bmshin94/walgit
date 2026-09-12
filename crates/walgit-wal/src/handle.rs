@@ -1018,6 +1018,11 @@ impl RepoHandle {
         synced: bool,
         created_at: Option<prost_types::Timestamp>,
     ) -> Result<PublishResult, WalError> {
+        if pack.is_some() && txn.updates.is_empty() {
+            return Err(WalError::Invalid(
+                "a push pack requires a nonempty ref transaction".into(),
+            ));
+        }
         let sender = self.get_or_init_publisher()?;
         self.publish_waiters.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = tokio::sync::oneshot::channel();

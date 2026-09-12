@@ -26,6 +26,7 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
 | `README.md` | The introduction: why (the Cursor lineage), what it does, how it works briefly, running it, invariants. |
 | `docs/PACKFILE_URI_DESIGN.md` | Anyone implementing pack groups, proofs, lifecycle, or negotiated delivery. Design target; later layers require separate implementation and evidence. |
 | `docs/PACKFILE_MIGRATION.md` | Bundle removal, saved settings, writer cutover, clients and rollout gates. |
+| `docs/spec/README.md` | Bounded models, contract identifiers, result semantics, code/test map and remaining verification gaps. |
 | `docs/ROUNDTRIPS.md` | **Anyone touching a protocol that talks to the bucket** (publish, sync, checkpoints, compaction/leases, remote reader, store backends). Round trips are the cost model; correct is not sufficient. |
 | `docs/POLICY.md` | Anyone touching receive-pack authorization or writing a repo policy. Normative rule language. |
 | `docs/LFS.md` | Anyone touching LFS (`lfs.rs`, `lfs_upstream.rs`) or importing a repository whose LFS history lives elsewhere. |
@@ -455,6 +456,15 @@ Unrelated constraints remain in force. The current design target and migration g
   knob is introduced. Large narrated dynamic clones warn. Scale and model/code mapping gates remain open.
 
 Decision identifiers are stable; gaps in the numbering are intentional.
+
+- **D47 (2026-09-12): Publication evidence and receipts are exact.** A no-op ref submission with no
+  new pack reports success at seq 0 without creating history; an empty-ref pack-only push rejects. A
+  rejected submission reports rejection for every command. Each immutable log claim carries a fresh
+  reserved `walgit.publication_nonce`; exact bytes, not key/sequence alone, resolve a lost CAS reply.
+  Missing evidence stays `CommitUnknown`. Buffered forwarding falls back only before delivery;
+  ambiguous transport and gateway replies never trigger local replay. Disable broker redirects and
+  automatic transport retries. Bounded models and their precise controls run in CI; the
+  [code/test map](docs/spec/README.md) records unproved boundaries and remaining corrections.
 
 ---
 

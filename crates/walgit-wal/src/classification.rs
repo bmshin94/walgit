@@ -472,7 +472,6 @@ impl RepoHandle {
             prune_invalid_coverages(&mut updated, &cfg, &output_ids);
             validate_certificates(self, &current, &updated, &output_ids, snapshots).await?;
             let at = time::now();
-            let mut size = 0usize;
             let slot = match claim_log_slot(&self.store, current.head_seq, |seq| {
                 let entry = LogEntry {
                     seq,
@@ -482,9 +481,7 @@ impl RepoHandle {
                     writer: crate::handle::instance_id(),
                     ..Default::default()
                 };
-                let bytes = frame::encode_entries(std::iter::once(&entry));
-                size = bytes.len();
-                bytes
+                frame::encode_entries(std::iter::once(&entry))
             })
             .await?
             {
@@ -510,7 +507,7 @@ impl RepoHandle {
                 key: slot.key.clone(),
                 first_seq: seq,
                 last_seq: seq,
-                size: size as u64,
+                size: slot.bytes.len() as u64,
                 sealed: true,
             });
             let mode = version.map_or(PutMode::Create, PutMode::Update);

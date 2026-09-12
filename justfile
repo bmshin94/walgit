@@ -94,7 +94,7 @@ dev-store-stop:
 test:
     {{t5}} cargo test --workspace --lib --bins
     {{t10}} cargo test -p walgit-store -p walgit-git -p walgit-wal --tests
-    {{t10}} cargo test -p walgit-server --test web_api --test web_ui --test api_v1 --test static_http --test packfile_uri --test maintain --test routing_prefix --test lfs_upstream --test drain --test events --test follow --test policy
+    {{t10}} cargo test -p walgit-server --test web_api --test web_ui --test api_v1 --test static_http --test packfile_uri --test forward --test maintain --test routing_prefix --test lfs_upstream --test drain --test events --test follow --test policy
 
 # Smart-HTTP end-to-end against real git (≈ 20 s) — run when touching smart.rs/receive/upload-pack/wal.
 e2e *ARGS:
@@ -168,3 +168,13 @@ store-test-s3:
 # Run all walgit-store tests (memory + S3 if env set).
 store-test-all:
     cargo test -p walgit-store
+
+# Bounded contract checks and exact negative controls (Java 11+).
+spec:
+    scripts/run-spec.sh fast
+
+spec-fragments:
+    scripts/run-spec.sh fragments
+
+spec-full:
+    scripts/run-spec.sh full
