@@ -118,6 +118,7 @@ pub enum ImportPhase {
     SideFiles,
     HistoryPack,
     Uploaded,
+    CheckpointPrepared,
 }
 
 /// `walgit-import/<owner>-<repo>.json` next to the pack dir: what an interrupted import had
@@ -172,7 +173,8 @@ fn write_import_marker(path: &Path, m: &ImportMarker) -> Result<()> {
 }
 
 /// Test hook: abort the import of `repo` right after `phase`'s marker was written (a SIGTERM /
-/// lost network between phases). `Uploaded` aborts after the first object of the upload phase.
+/// lost network between phases). `Uploaded` aborts after the first object of the upload phase;
+/// `CheckpointPrepared` stops after immutable candidates and before the manifest CAS.
 pub static TEST_ABORT_AFTER: parking_lot::Mutex<
     Option<std::collections::HashMap<String, ImportPhase>>,
 > = parking_lot::Mutex::new(None);
@@ -336,6 +338,11 @@ pub async fn run_with_store(
     let (base_manifest, base_version) = match existing {
         Some((meta, bytes)) => {
             let m = Manifest::decode(bytes.as_ref()).context("decoding existing manifest")?;
+            walgit_wal::validate_manifest(&m).context("validating existing manifest")?;
+            anyhow::ensure!(
+                m.repo == id.to_string(),
+                "manifest repository identity disagrees with target"
+            );
             if m.object_format != format.as_str() {
                 bail!(
                     "object format mismatch: repo is {}, source is {}",
@@ -680,6 +687,8 @@ pub async fn run_with_store(
                 walgit_proto::v1::PackKind::Objects as i32
             },
             derived_from: p.history_of.clone().unwrap_or_default(),
+            published_at: Some(time::now()),
+            ..Default::default()
         });
     }
     if marker.phase < ImportPhase::Uploaded {
@@ -694,23 +703,33 @@ pub async fn run_with_store(
         up_started.elapsed().as_secs_f64()
     );
 
-    // ---- checkpoint refs (small, idempotent re-put) -----------------------------------------
-    let refs_key = keys::checkpoint_refs_key(seq);
-    let mut snap = snap;
+    // Preserve classifications and provenance of identical immutable packs already committed.
+    // Fresh imports have no group proof until maintenance classifies their actual object sets.
+    if let Some(base) = &base_manifest {
+        for pack in &mut pack_refs {
+            if let Some(previous) = base.packs.iter().find(|p| p.checksum == pack.checksum) {
+                anyhow::ensure!(
+                    previous.pack_size == pack.pack_size && previous.idx_size == pack.idx_size,
+                    "committed pack {} disagrees with import sizes",
+                    pack.checksum
+                );
+                let mut retained = previous.clone();
+                retained.has_rev |= pack.has_rev;
+                retained.has_bitmap |= pack.has_bitmap;
+                retained.has_commit_graph |= pack.has_commit_graph;
+                *pack = retained;
+            }
+        }
+    }
+
+    // Both immutable candidates are named exactly by the manifest CAS. A concurrent
+    // import may prepare different refs at the same sequence without overwriting these bytes.
     snap.seq = seq;
     snap.object_format = format.as_str().to_string();
-    snap.created_at = Some(time::now());
-    repo_store
-        .put(
-            &refs_key,
-            PutBody::Bytes(snap.encode_to_vec().into()),
-            PutOptions {
-                immutable: true,
-                ..Default::default()
-            },
-        )
-        .await?;
-
+    let snap_bytes = walgit_proto::snapshot::encode(&snap)?;
+    let refs_key = walgit_proto::snapshot::key(&snap_bytes);
+    let created_at = time::now();
+    let writer = format!("walgit-import@{}", hostname());
     let checkpoint = Checkpoint {
         seq,
         object_format: format.as_str().to_string(),
@@ -718,44 +737,56 @@ pub async fn run_with_store(
         refs_key: refs_key.clone(),
         ref_count: snap.refs.len() as u64,
         bundle_key: String::new(),
-        created_at: Some(time::now()),
-        writer: format!("walgit-import@{}", hostname()),
+        created_at: Some(created_at),
+        writer: writer.clone(),
     };
-    let cp_key = keys::checkpoint_key(seq);
-    repo_store
-        .put(
-            &cp_key,
-            PutBody::Bytes(checkpoint.encode_to_vec().into()),
-            PutOptions {
-                immutable: true,
-                ..Default::default()
-            },
-        )
-        .await?;
+    let cp_key = keys::checkpoint_attempt_key(seq, &format!("{:032x}", rand::random::<u128>()));
+    let (refs_result, checkpoint_result) = tokio::join!(
+        put_snapshot_candidate(&repo_store, &refs_key, snap_bytes),
+        put_snapshot_candidate(&repo_store, &cp_key, checkpoint.encode_to_vec()),
+    );
+    refs_result?;
+    checkpoint_result?;
+    marker.phase = ImportPhase::CheckpointPrepared;
+    write_import_marker(&marker_path, &marker)?;
+    abort_after(&repo_key, ImportPhase::CheckpointPrepared)?;
 
-    // ---- manifest CAS (the linearization point) --------------------------------------
-    let manifest = Manifest {
+    // Replace repository content on the captured CAS basis, preserving unrelated durable state.
+    // A conflict refuses the import; --force starts a new attempt against the changed manifest.
+    let mut manifest = base_manifest.clone().unwrap_or_else(|| Manifest {
         format_version: WAL_FORMAT_VERSION,
         repo: id.to_string(),
         object_format: format.as_str().to_string(),
-        head_seq: seq,
-        min_seq: seq + 1,
-        // An import's first state is the import itself (history before it is
-        // not in the WAL): first_state_at = as_of = now.
-        checkpoint: Some(CheckpointRef {
-            seq,
-            key: cp_key,
-            created_at: Some(walgit_proto::time::now()),
-            first_state_at: Some(walgit_proto::time::now()),
-            as_of: Some(walgit_proto::time::now()),
-        }),
-        log_segments: vec![],
-        packs: pack_refs,
-        updated_at: Some(time::now()),
-        writer: format!("walgit-import@{}", hostname()),
-        revision: base_manifest.as_ref().map_or(0, |m| m.revision) + 1,
-        settings: None,
-    };
+        ..Default::default()
+    });
+    let removed: Vec<_> = manifest
+        .packs
+        .iter()
+        .filter(|old| !pack_refs.iter().any(|new| new.checksum == old.checksum))
+        .map(|old| old.checksum.clone())
+        .collect();
+    manifest.retire_packs(&removed, seq);
+    let first_state_at = manifest
+        .checkpoint
+        .as_ref()
+        .and_then(|cp| cp.first_state_at)
+        .or(Some(created_at));
+    manifest.head_seq = seq;
+    manifest.min_seq = seq + 1;
+    manifest.checkpoint = Some(CheckpointRef {
+        seq,
+        key: cp_key,
+        refs_key,
+        created_at: Some(created_at),
+        first_state_at,
+        as_of: Some(created_at),
+    });
+    manifest.log_segments.clear();
+    manifest.packs = pack_refs;
+    manifest.updated_at = Some(created_at);
+    manifest.writer = writer;
+    manifest.revision += 1;
+    walgit_wal::validate_manifest(&manifest).context("validating import manifest")?;
     let mode = match base_version {
         Some(v) => PutMode::Update(v),
         None => PutMode::Create,
@@ -790,6 +821,37 @@ pub async fn run_with_store(
 }
 
 // ---- helpers -------------------------------------------------------------------
+
+/// Immutable small candidates are never overwritten. A precondition failure is safe
+/// only when the existing bytes match; all verification reads stay on that failure path.
+async fn put_snapshot_candidate(store: &Prefixed, key: &str, bytes: Vec<u8>) -> Result<()> {
+    match store
+        .put(
+            key,
+            PutBody::Bytes(bytes.clone().into()),
+            PutOptions {
+                mode: PutMode::Create,
+                immutable: true,
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(StoreError::PreconditionFailed { .. }) => {
+            let (_, existing) = store
+                .get_bytes(key)
+                .await?
+                .with_context(|| format!("candidate {key} disappeared after Create conflict"))?;
+            anyhow::ensure!(
+                existing.as_ref() == bytes.as_slice(),
+                "immutable candidate {key} has conflicting bytes"
+            );
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
 
 fn hostname() -> String {
     std::fs::read_to_string("/etc/hostname")
@@ -1314,6 +1376,7 @@ mod resume_tests {
             ImportPhase::SideFiles,
             ImportPhase::HistoryPack,
             ImportPhase::Uploaded,
+            ImportPhase::CheckpointPrepared,
         ] {
             set_abort(repo, Some(phase));
             let r = run_with_store(opts(src.path(), repo), store.clone(), false).await;
@@ -1462,6 +1525,181 @@ mod resume_tests {
         assert!(
             !r.resumed && !r.noop && r.cas == 1 && r.skipped >= 1,
             "{r:?}"
+        );
+    }
+    async fn manifest(store: &Prefixed) -> Manifest {
+        let (_, bytes) = store.get_bytes(keys::MANIFEST).await.unwrap().unwrap();
+        Manifest::decode(bytes.as_ref()).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replacement_preserves_settings_retired_inventory_and_unchanged_pack_scope() {
+        let src = source();
+        let store = walgit_store::memory::MemoryStore::shared();
+        let repo = "t/preserve";
+        let mut options = opts(src.path(), repo);
+        options.history_pack = false;
+        options.commit_graph = false;
+        run_with_store(options, store.clone(), false).await.unwrap();
+        let scoped = Prefixed::new(store.clone(), "repos/t/preserve/");
+        let mut before = manifest(&scoped).await;
+        before.settings = Some(walgit_proto::v1::RepoSettings {
+            toml: "[compaction]\ntrigger_packs = 7\n".into(),
+            revision: 5,
+            author: "operator".into(),
+            ..Default::default()
+        });
+        before.retired_packs.push(walgit_proto::v1::RetiredPack {
+            checksum: "ab".repeat(20),
+            retired_seq: 0,
+            retired_at: Some(time::now()),
+        });
+        before.packs[0].pack_groups = vec!["code".into()];
+        before.packs[0].ref_policy = "classified-policy".into();
+        let original_pack = before.packs[0].clone();
+        // Exercise an earlier checkpoint whose refs pointer exists only in its metadata.
+        let cp = before.checkpoint.as_mut().unwrap();
+        let (_, original_cp_bytes) = scoped.get_bytes(&cp.key).await.unwrap().unwrap();
+        let original_cp = Checkpoint::decode(original_cp_bytes.as_ref()).unwrap();
+        let old_refs_key = original_cp.refs_key;
+        cp.refs_key.clear();
+        scoped
+            .put_bytes(keys::MANIFEST, before.encode_to_vec(), PutMode::Overwrite)
+            .await
+            .unwrap();
+
+        std::fs::write(src.path().join("next"), "next commit").unwrap();
+        sh(src.path(), &["add", "."]);
+        sh(src.path(), &["commit", "-q", "-m", "next"]);
+        // Keep the original immutable pack and add a separate new pack.
+        sh(src.path(), &["repack", "-d", "-q"]);
+        sh(src.path(), &["prune-packed"]);
+        let mut options = opts(src.path(), repo);
+        options.history_pack = false;
+        options.commit_graph = false;
+        options.replace = true;
+        run_with_store(options, store.clone(), false).await.unwrap();
+        let after = manifest(&scoped).await;
+        assert_eq!(after.settings, before.settings);
+        assert_eq!(after.retired_packs, before.retired_packs);
+        assert_eq!(
+            after
+                .packs
+                .iter()
+                .find(|p| p.checksum == original_pack.checksum),
+            Some(&original_pack)
+        );
+        assert!(scoped.get_bytes(&old_refs_key).await.unwrap().is_some());
+        let cp = after.checkpoint.as_ref().unwrap();
+        assert!(cp.key.contains("/attempts/"));
+        let (_, bytes) = scoped.get_bytes(&cp.refs_key).await.unwrap().unwrap();
+        let snap = walgit_proto::snapshot::decode_verified(&cp.refs_key, &bytes).unwrap();
+        assert_eq!(snap.seq, after.head_seq);
+        assert_eq!(snap.head_target, "refs/heads/main");
+        assert_eq!(
+            snap.refs
+                .iter()
+                .find(|r| r.name == "refs/heads/main")
+                .unwrap()
+                .oid,
+            sh(src.path(), &["rev-parse", "HEAD"])
+        );
+        assert!(snap.created_at.is_none());
+
+        // A later whole-pack import retires every removed live pack and retains their bytes.
+        sh(src.path(), &["repack", "-adb", "-q"]);
+        sh(src.path(), &["prune-packed"]);
+        let mut options = opts(src.path(), repo);
+        options.history_pack = false;
+        options.commit_graph = false;
+        options.replace = true;
+        run_with_store(options, store.clone(), false).await.unwrap();
+        let replaced = manifest(&scoped).await;
+        assert_eq!(replaced.settings, before.settings);
+        for old in &after.packs {
+            assert!(replaced.serves_pack(&old.checksum));
+            assert!(
+                scoped
+                    .get_bytes(&keys::pack_key(&old.checksum))
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            if !replaced.packs.iter().any(|p| p.checksum == old.checksum) {
+                assert!(
+                    replaced
+                        .retired_packs
+                        .iter()
+                        .any(|p| p.checksum == old.checksum && p.retired_seq == replaced.head_seq)
+                );
+            }
+        }
+        assert!(
+            replaced
+                .retired_packs
+                .iter()
+                .any(|p| p.checksum == "ab".repeat(20))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unknown_manifest_format_is_rejected_before_any_upload() {
+        let src = source();
+        let store = walgit_store::memory::MemoryStore::shared();
+        let scoped = Prefixed::new(store.clone(), "repos/t/unknown/");
+        let invalid = Manifest {
+            format_version: u32::MAX,
+            repo: "t/unknown".into(),
+            object_format: "sha1".into(),
+            ..Default::default()
+        };
+        scoped
+            .put_bytes(keys::MANIFEST, invalid.encode_to_vec(), PutMode::Create)
+            .await
+            .unwrap();
+        let error = run_with_store(opts(src.path(), "t/unknown"), store, false)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("unsupported manifest format"),
+            "{error:#}"
+        );
+        assert_eq!(manifest(&scoped).await, invalid);
+        let pack_dir = crate::import::resolve_git_dir(src.path())
+            .unwrap()
+            .join("objects/pack");
+        for pack in scan_packs(&pack_dir).unwrap() {
+            assert!(
+                scoped
+                    .get_bytes(&keys::pack_key(&pack.checksum))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn immutable_snapshot_candidates_never_overwrite_conflicting_bytes() {
+        let store = Prefixed::new(
+            walgit_store::memory::MemoryStore::shared(),
+            "repos/t/candidate/",
+        );
+        let key = "checkpoints/refs/example.pb";
+        put_snapshot_candidate(&store, key, vec![1, 2])
+            .await
+            .unwrap();
+        put_snapshot_candidate(&store, key, vec![1, 2])
+            .await
+            .unwrap();
+        assert!(
+            put_snapshot_candidate(&store, key, vec![3, 4])
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store.get_bytes(key).await.unwrap().unwrap().1.as_ref(),
+            &[1, 2]
         );
     }
 }

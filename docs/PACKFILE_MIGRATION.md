@@ -85,6 +85,10 @@ authority. A new format number alone cannot fence old binaries: the pre-migratio
 `Manifest.format_version`. A future minimum-reader gate protects only readers that implement it; it cannot
 retroactively make deployed old readers safe.
 An older binary that drops these fields can invalidate issued URLs or proofs even if it can decode the message.
+The coverage-foundation writer uses canonical content-addressed ref snapshots and attempt-specific checkpoint
+metadata as soon as it runs; there is no separate snapshot-writing toggle. Complete the incompatible-writer
+stop before starting this binary against an existing bucket. Old checkpoint snapshots remain readable through
+their committed descriptor; readers must not reconstruct an old snapshot address from sequence alone.
 The rollback floor is therefore the earliest tested release preserving the new authority, not simply a binary
 that accepts the protobuf. A concrete compatible release hash must be recorded before enabling the new writer;
 none is certified by the removal unit.

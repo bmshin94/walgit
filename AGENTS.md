@@ -400,6 +400,17 @@ Unrelated constraints remain in force. The current design target and migration g
   [PACKFILE_MIGRATION.md](docs/PACKFILE_MIGRATION.md) defines compatible-writer rollout and evidence gates;
   no bucket deletion is part of this change. D42 overrides bundle-specific parts of earlier decisions only.
 
+- **D43 (2026-09-11): Coverage and retirement authority lives in the manifest.** Named packing groups and
+  advertisement selectors are independent policies; group kinds grant no access. Canonical content-addressed
+  ref snapshots bind certificates to an exact captured generation. Every classification/compaction CAS checks
+  current policy, live members and same-generation dependencies; stale certificates lose eligibility without
+  deleting their objects. Retired checksums remain recorded indefinitely. Checkpoint metadata uses unique
+  attempt keys and commits the exact refs key; old checkpoints resolve their original committed descriptor.
+  Producers capture manifest, CAS token, refs and validated settings coherently. Invalid saved packing policy
+  fails coverage capture instead of substituting host defaults. Stop incompatible writers before the new
+  writer runs: older binaries do not enforce format-version fencing. This foundation alone does not emit URLs
+  or prove object conservation; those require the lifecycle and transport layers described in D42.
+
 Decision identifiers are stable; gaps in the numbering are intentional.
 
 ---

@@ -657,6 +657,32 @@ async fn test_compact_replays_on_other_registry() {
         );
     }
 
+    // Retirement is durable across restart and other manifest writers; static
+    // readers can finish previously issued downloads after compaction.
+    let retired = handle2.manifest().retired_packs.clone();
+    for old in &supersedes {
+        let checksum = old.to_string();
+        assert!(retired.iter().any(|p| p.checksum == checksum));
+        assert!(handle2.manifest().serves_pack(&checksum));
+        assert!(
+            store
+                .head(&format!(
+                    "{}{}",
+                    id.store_prefix(),
+                    walgit_proto::keys::pack_key(&checksum)
+                ))
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+    handle2
+        .publish_settings("", "test", "preserve retirement")
+        .await
+        .unwrap();
+    handle2.write_checkpoint().await.unwrap();
+    assert_eq!(handle2.manifest().retired_packs, retired);
+
     // Objects should be readable
     let oid = gix_hash::ObjectId::from_hex(prev.as_bytes()).unwrap();
     assert!(

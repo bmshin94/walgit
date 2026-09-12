@@ -4,6 +4,7 @@
 //! D2 and docs/CONTRACT.md walgit-git.
 
 pub mod follow;
+pub mod pack_groups;
 pub mod pkt;
 pub mod receive;
 pub mod repair;

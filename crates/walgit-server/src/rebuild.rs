@@ -1,4 +1,4 @@
-//! Resumable base rebuild (`docs/BUNDLE_URI_DESIGN.md` §5a): `git repack -adb` of a big
+//! Resumable base rebuild (see `docs/PACKFILE_URI_DESIGN.md` for its replacement): `git repack -adb` of a big
 //! repository is 16–30 min of one core plus a 10-min history pack; a deploy mid-way (D31
 //! interrupts units at once) used to throw that away and — worse — the repack rewrote the
 //! *serving copy's* `objects/pack` in place.
