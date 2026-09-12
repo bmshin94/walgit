@@ -5,6 +5,7 @@ mod checkpoint;
 mod classification;
 mod error;
 mod handle;
+mod index_cache;
 pub mod lockwait;
 mod log_reader;
 pub mod progress;

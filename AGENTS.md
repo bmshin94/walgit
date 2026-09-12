@@ -468,6 +468,18 @@ Decision identifiers are stable; gaps in the numbering are intentional.
 
 ---
 
+- **D48 (2026-09-12): Cache evidence and readiness.**
+
+Remote index admission verifies index checksum, pack checksum identity and known descriptor size/count,
+including reused installed links. Repair installs a fresh inode. A repository-local kernel lock protects
+cache names across processes until callers own opened mappings or independent links; blocking workers keep
+the lock through cancellation. Temporary names belong to one attempt, and abandoned names are reclaimed
+only while holding the lock. This local ownership is disposable cache coordination, never publication
+truth. Carry pack readiness only from a proven matching inventory; inherited nonempty caches reconcile on
+open, including manifest changes that advance revision without adding a log entry. Small downloads reject
+short or oversized bodies. These checks do not replace the required per-CAS closure proof or establish the
+full cold-read/resource acceptance gates listed in `docs/spec/README.md`.
+
 ## 5. Working rules
 
 - **No backwards compatibility (pre-1.0, banner at top):** change the shape and delete the old one in the same
