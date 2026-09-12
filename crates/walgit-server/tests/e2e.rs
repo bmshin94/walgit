@@ -1142,7 +1142,6 @@ async fn fetch_from_front_that_serves_the_base_remotely() -> TestResult {
     let log = |line: String| println!("compact: {line}");
     let out = walgit_server::ops::compact_repo(
         &handle,
-        &big.state.cfg,
         walgit_server::ops::CompactRequest {
             force: true,
             rebuild_base: true,
@@ -1152,11 +1151,17 @@ async fn fetch_from_front_that_serves_the_base_remotely() -> TestResult {
     .await?;
     println!("{}", out.summary());
     let m = handle.manifest();
-    let base = m.packs.iter().find(|p| p.tier == 2).expect("a tier-2 base");
+    let base = m
+        .packs
+        .iter()
+        .find(|p| p.tier == 2 && p.has_commit_graph)
+        .expect("a frozen pack carrying the commit-graph layer");
     assert!(
         base.has_commit_graph,
         "base carries a commit-graph layer: {base:?}"
     );
+    let remote_pack = m.packs.iter().max_by_key(|p| p.pack_size).unwrap();
+    assert_eq!(remote_pack.kind, walgit_proto::v1::PackKind::Blobs as i32);
     let base_tip = git_in(&src, &["rev-parse", "main"])?.trim().to_string();
 
     // Client: full clone from the big front.
@@ -1184,7 +1189,9 @@ async fn fetch_from_front_that_serves_the_base_remotely() -> TestResult {
 
     // Small front: cannot hold the base, no mount → remote-served.
     let small = big
-        .start_sibling_with(|c| c.cache.max_bytes = bytesize::ByteSize::b(base.pack_size / 2))
+        .start_sibling_with(|c| {
+            c.cache.max_bytes = bytesize::ByteSize::b(remote_pack.pack_size / 2);
+        })
         .await?;
     let url = small.repo_url("t", "rbase");
     git_in(clone.path(), &["remote", "set-url", "origin", &url])?;
@@ -1214,12 +1221,23 @@ async fn fetch_from_front_that_serves_the_base_remotely() -> TestResult {
     assert!(stderr.contains("read from the bucket by range"), "{stderr}");
     // The small front never materialized the base pack.
     let sh = small.state.registry.open(&id).await?;
-    assert_eq!(sh.remote_served(), vec![base.checksum.clone()]);
-    assert!(
-        !sh.local()
-            .pack_path(&gix_hash::ObjectId::from_hex(base.checksum.as_bytes())?)
-            .exists()
-    );
+    let mut expected_remote: Vec<_> = m
+        .packs
+        .iter()
+        .filter(|p| p.tier == 2)
+        .map(|p| p.checksum.clone())
+        .collect();
+    expected_remote.sort();
+    let mut actual_remote = sh.remote_served();
+    actual_remote.sort();
+    assert_eq!(actual_remote, expected_remote);
+    for checksum in &expected_remote {
+        assert!(
+            !sh.local()
+                .pack_path(&gix_hash::ObjectId::from_hex(checksum.as_bytes())?)
+                .exists()
+        );
+    }
 
     // Protocol v0 is refused with a readable explanation (stock git cannot
     // read a remote-served base).
@@ -1514,7 +1532,7 @@ async fn history_pack_install_does_not_stall_the_runtime() -> TestResult {
         std::fs::write(
             shim.path().join("git"),
             format!(
-                "#!/bin/sh\nif [ \"$1\" = multi-pack-index ]; then sleep 3; fi\nexec {real_git} \"$@\"\n"
+                "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = multi-pack-index ]; then sleep 3; break; fi\ndone\nexec {real_git} \"$@\"\n"
             ),
         )?;
         std::fs::set_permissions(
@@ -1557,7 +1575,6 @@ async fn history_pack_install_does_not_stall_the_runtime() -> TestResult {
     let log = |line: String| println!("compact: {line}");
     walgit_server::ops::compact_repo(
         &h,
-        &big.state.cfg,
         walgit_server::ops::CompactRequest {
             force: true,
             rebuild_base: true,
@@ -1761,16 +1778,21 @@ async fn repo_settings_api_roundtrip() -> TestResult {
     // Valid.
     let r = c
         .put(url(&a, "?message=tiny+repo"))
-        .body("[compaction]\ntrigger_packs = 2\n")
+        .body("[packs]\nfold_when_fresh_packs_reach = 2\n")
         .send()
         .await?;
     assert_eq!(r.status(), 200, "{}", r.text().await?);
     let r: serde_json::Value = c.get(url(&a, "")).send().await?.json().await?;
     assert_eq!(r["revision"], 1);
     assert_eq!(r["message"], "tiny repo");
-    assert!(r["toml"].as_str().unwrap().contains("trigger_packs = 2"));
+    assert!(
+        r["toml"]
+            .as_str()
+            .unwrap()
+            .contains("fold_when_fresh_packs_reach = 2")
+    );
     let eff = c.get(url(&a, "/effective")).send().await?.text().await?;
-    assert!(eff.contains("trigger_packs = 2"), "{eff}");
+    assert!(eff.contains("fold_when_fresh_packs_reach = 2"), "{eff}");
     assert!(!eff.contains("session_secret"), "{eff}");
     assert!(!eff.contains("[server]"), "{eff}");
 
@@ -1784,8 +1806,8 @@ async fn repo_settings_api_roundtrip() -> TestResult {
             .open(&id)
             .await?
             .effective_config()
-            .compaction
-            .trigger_packs,
+            .packs
+            .fold_when_fresh_packs_reach,
         2
     );
 
@@ -1851,7 +1873,7 @@ async fn settings_describe_validate_and_policy_dry_run() -> TestResult {
     // Validate: preview flips the touched field's source; errors come back as a list.
     let v: serde_json::Value = c
         .post(format!("{base}/settings/validate"))
-        .body("[compaction]\ntrigger_packs = 4\n")
+        .body("[packs]\nfold_when_fresh_packs_reach = 4\n")
         .send()
         .await?
         .json()
@@ -1861,7 +1883,7 @@ async fn settings_describe_validate_and_policy_dry_run() -> TestResult {
         .as_array()
         .unwrap()
         .iter()
-        .find(|f| f["key"] == "compaction.trigger_packs")
+        .find(|f| f["key"] == "packs.fold_when_fresh_packs_reach")
         .unwrap();
     assert_eq!(f["value"], 4);
     assert_eq!(f["source"], "setting");

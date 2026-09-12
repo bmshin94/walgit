@@ -7,7 +7,7 @@ use std::sync::Arc;
 use walgit_proto::v1::{Manifest, PackAudience, PackGroupCoverage, PackKind, PackRef};
 use walgit_store::{ObjectStore, PutBody, PutMode, StoreError};
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct PackClassification {
     pub checksum: String,
     pub kind: i32,
@@ -46,6 +46,30 @@ impl PackClassification {
 
 fn invalid(message: impl Into<String>) -> WalError {
     WalError::Invalid(message.into())
+}
+
+fn audience_matches(
+    pack: &PackRef,
+    kind: walgit_config::PackGroupKind,
+    cfg: &walgit_config::Config,
+) -> bool {
+    let code = pack.pack_groups.iter().any(|name| {
+        cfg.refs
+            .packfiles
+            .get(name)
+            .is_some_and(|g| g.kind == walgit_config::PackGroupKind::Code)
+    });
+    match kind {
+        walgit_config::PackGroupKind::Code => pack.audience == PackAudience::Code as i32,
+        walgit_config::PackGroupKind::Meta => {
+            pack.audience
+                == if code {
+                    PackAudience::Code as i32
+                } else {
+                    PackAudience::Meta as i32
+                }
+        }
+    }
 }
 
 /// Removing/reclassifying inputs revokes surviving certificates that no longer
@@ -148,11 +172,7 @@ pub(crate) async fn validate_certificates(
                 .packfiles
                 .get(group)
                 .ok_or_else(|| invalid(format!("unknown pack group {group}")))?;
-            let audience = match definition.kind {
-                walgit_config::PackGroupKind::Code => PackAudience::Code,
-                walgit_config::PackGroupKind::Meta => PackAudience::Meta,
-            };
-            if pack.ref_policy != policy || pack.audience != audience as i32 {
+            if pack.ref_policy != policy || !audience_matches(pack, definition.kind, &cfg) {
                 return Err(invalid(
                     "pack classification has stale policy or wrong audience",
                 ));
@@ -201,11 +221,7 @@ pub(crate) async fn validate_certificates(
                     {
                         return Err(invalid("coverage member scope changed"));
                     }
-                    let expected = match definition.kind {
-                        walgit_config::PackGroupKind::Code => PackAudience::Code,
-                        walgit_config::PackGroupKind::Meta => PackAudience::Meta,
-                    };
-                    if p.audience != expected as i32 {
+                    if !audience_matches(p, definition.kind, &cfg) {
                         return Err(invalid("coverage member audience changed"));
                     }
                 }
@@ -344,4 +360,211 @@ impl RepoHandle {
             attempts: self.cfg.wal.cas_max_retries,
         })
     }
+}
+
+impl RepoHandle {
+    /// Complete a conserving multi-output replacement. Outputs must already be
+    /// committed; until this CAS, all original inputs remain live. The producer
+    /// verifies indexed-object conservation before calling this metadata seal.
+    pub async fn seal_pack_replacement(
+        &self,
+        captured: &crate::PublicationView,
+        inputs: &[String],
+        outputs: &[PackRef],
+        snapshots: &[CoverageSnapshot],
+        lease: &tokio::sync::Mutex<walgit_store::coord::LeaseGuard>,
+    ) -> Result<u64, WalError> {
+        use crate::publish::{ClaimOutcome, claim_log_slot, drop_own_slot, sweep_burned};
+        use walgit_proto::v1::{EntryKind, LogEntry, LogSegmentRef};
+        use walgit_proto::{frame, keys, time};
+        if inputs.is_empty() || outputs.is_empty() || inputs.len() > 4096 || outputs.len() > 4096 {
+            return Err(invalid(
+                "replacement needs bounded, nonempty input/output sets",
+            ));
+        }
+        if captured.manifest.repo != self.id.to_string() {
+            return Err(invalid("replacement input belongs to another repository"));
+        }
+        let output_ids: Vec<_> = outputs.iter().map(|p| p.checksum.clone()).collect();
+        if inputs.iter().collect::<BTreeSet<_>>().len() != inputs.len()
+            || output_ids.iter().collect::<BTreeSet<_>>().len() != output_ids.len()
+        {
+            return Err(invalid("duplicate replacement input/output"));
+        }
+        let retire: Vec<_> = inputs
+            .iter()
+            .filter(|id| !output_ids.contains(id))
+            .cloned()
+            .collect();
+        for attempt in 0..self.cfg.wal.cas_max_retries {
+            lease
+                .lock()
+                .await
+                .heartbeat(captured.config.packs.lease_ttl)
+                .await
+                .map_err(|e| invalid(format!("replacement lease: {e}")))?;
+            self.sync_impl_level(crate::SyncLevel::Refs).await?;
+            let (current, version) = self.manifest_pair();
+            let cfg = self.validated_config_for_manifest(&current)?;
+            if cfg.refs.policy_identity() != captured.config.refs.policy_identity() {
+                return Err(invalid("packing policy changed during replacement"));
+            }
+            // Recovery after a lost successful final response. Exact outputs
+            // and retirement, not a local ledger, witness the already-sealed job.
+            if !retire.is_empty()
+                && retire.iter().all(|id| {
+                    current.retired_packs.iter().any(|p| p.checksum == *id)
+                        && !current.packs.iter().any(|p| p.checksum == *id)
+                })
+                && outputs.iter().all(|out| {
+                    current.packs.iter().any(|p| {
+                        PackClassification::from_pack(p) == PackClassification::from_pack(out)
+                            && p.tier == out.tier
+                            && p.derived_from == out.derived_from
+                            && same_pack_bytes(p, out)
+                    })
+                })
+            {
+                return Ok(current.head_seq);
+            }
+            for id in inputs {
+                let original = captured
+                    .manifest
+                    .packs
+                    .iter()
+                    .find(|p| p.checksum == *id)
+                    .ok_or_else(|| invalid("replacement input was never captured"))?;
+                let live = current
+                    .packs
+                    .iter()
+                    .find(|p| p.checksum == *id)
+                    .ok_or_else(|| invalid("replacement input retired during work"))?;
+                if PackClassification::from_pack(original) != PackClassification::from_pack(live)
+                    || original.derived_from != live.derived_from
+                    || original.tier != live.tier
+                    || !same_pack_bytes(original, live)
+                {
+                    return Err(invalid("replacement input scope changed during work"));
+                }
+            }
+            let mut updated = (*current).clone();
+            for out in outputs {
+                let pack = updated
+                    .packs
+                    .iter_mut()
+                    .find(|p| p.checksum == out.checksum)
+                    .ok_or_else(|| invalid("replacement output is not committed"))?;
+                if !same_pack_bytes(pack, out) {
+                    return Err(invalid("replacement output descriptor changed"));
+                }
+                PackClassification::from_pack(out).apply(pack);
+                pack.tier = out.tier;
+                pack.derived_from.clone_from(&out.derived_from);
+                if pack.published_at.is_none() {
+                    pack.published_at = Some(time::now());
+                }
+            }
+            // Validate before claiming a log slot: incomplete outputs never
+            // create even an orphan retirement record.
+            let prospective_seq = current.head_seq.saturating_add(1);
+            updated.retire_packs(&retire, prospective_seq);
+            updated.packs.retain(|p| !retire.contains(&p.checksum));
+            prune_invalid_coverages(&mut updated, &cfg, &output_ids);
+            validate_certificates(self, &current, &updated, &output_ids, snapshots).await?;
+            let at = time::now();
+            let mut size = 0usize;
+            let slot = match claim_log_slot(&self.store, current.head_seq, |seq| {
+                let entry = LogEntry {
+                    seq,
+                    kind: EntryKind::Compact as i32,
+                    supersedes: retire.clone(),
+                    created_at: Some(at),
+                    writer: crate::handle::instance_id(),
+                    ..Default::default()
+                };
+                let bytes = frame::encode_entries(std::iter::once(&entry));
+                size = bytes.len();
+                bytes
+            })
+            .await?
+            {
+                ClaimOutcome::Claimed(slot) => slot,
+                ClaimOutcome::Contended => continue,
+            };
+            let seq = slot.first_seq;
+            for retired in &mut updated.retired_packs {
+                if retire.contains(&retired.checksum)
+                    && !current
+                        .retired_packs
+                        .iter()
+                        .any(|p| p.checksum == retired.checksum)
+                {
+                    retired.retired_seq = seq;
+                }
+            }
+            updated.head_seq = seq;
+            updated.revision += 1;
+            updated.updated_at = Some(at);
+            updated.writer = crate::handle::instance_id();
+            updated.log_segments.push(LogSegmentRef {
+                key: slot.key.clone(),
+                first_seq: seq,
+                last_seq: seq,
+                size: size as u64,
+                sealed: true,
+            });
+            let mode = version.map_or(PutMode::Create, PutMode::Update);
+            let result = self
+                .store
+                .put(
+                    keys::MANIFEST,
+                    PutBody::Bytes(updated.encode_to_vec().into()),
+                    mode.into(),
+                )
+                .await;
+            let committed = match result {
+                Ok(meta) => Some((updated, meta.version)),
+                Err(StoreError::PreconditionFailed { .. }) => None,
+                Err(error) => match crate::publish::cas_landed(&self.store, &slot).await? {
+                    Some(pair) => Some(pair),
+                    None => return Err(error.into()),
+                },
+            };
+            if let Some((committed, version)) = committed {
+                let _sync = self.sync_mutex.lock().await;
+                let applied = self.state.lock().applied_seq;
+                if committed.head_seq > seq && applied < committed.head_seq {
+                    crate::sync::apply_delta(self, &committed, &version).await?;
+                }
+                if self.adopt_manifest(Arc::new(committed.clone()), version.clone()) {
+                    let mut state = self.state.lock();
+                    state.manifest_version = Some(version.as_str().to_string());
+                    state.applied_seq = committed.head_seq;
+                    state.revision = committed.revision;
+                    for id in &retire {
+                        if !state.pending_pack_removals.contains(id) {
+                            state.pending_pack_removals.push(id.clone());
+                        }
+                    }
+                }
+                sweep_burned(&self.store, &slot).await;
+                return Ok(seq);
+            }
+            drop_own_slot(&self.store, &slot).await;
+            tokio::time::sleep(std::time::Duration::from_millis(5 + u64::from(attempt) * 7)).await;
+        }
+        Err(WalError::Retry {
+            attempts: self.cfg.wal.cas_max_retries,
+        })
+    }
+}
+
+fn same_pack_bytes(left: &PackRef, right: &PackRef) -> bool {
+    left.checksum == right.checksum
+        && left.pack_size == right.pack_size
+        && left.idx_size == right.idx_size
+        && left.object_count == right.object_count
+        && left.has_rev == right.has_rev
+        && left.has_bitmap == right.has_bitmap
+        && left.has_commit_graph == right.has_commit_graph
 }

@@ -11,7 +11,8 @@
 # walgit streams every byte itself.
 #
 # Prerequisites on this machine: `git` >= 2.46 (credential `authtype`) and an
-# S3-compatible or GCS bucket. `just dev-store` starts rustfs in a container for local play.
+# S3-compatible or GCS bucket. GNU coreutils (sort/comm) supports bounded pack planning.
+# `just dev-store` starts rustfs in a container for local play.
 # Every key not set here keeps the default documented in walgit.example.toml.
 
 [server]

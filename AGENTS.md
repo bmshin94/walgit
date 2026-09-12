@@ -188,21 +188,27 @@ runtime** and never takes the refs phase's lock (D19). `check_fits` refuses to p
 - **Never LIST on a hot path**; 404s are free; probe, don't list. Immutable objects get
   `Cache-Control: public, max-age=31536000, immutable` + strong ETag + Range everywhere (D10 static contract).
 
-### 2.5 Compaction (WAL + git), leader by lease
-- Assigned maintainers run **geometric** folding of fresh packs (tier 0 → tier 1, `git repack -d --geometric
-  --write-midx`) under `leases/compact.pb`; the result is a COMPACT entry; followers download the new pack and
-  drop superseded ones after in-flight readers finish. Triggers: `compaction.trigger_packs`, `trigger_bytes` —
-  and at least **two** fresh packs (one pack folds into itself).
-- **The base (tier 2, one pack + bitmap)** is rebuilt explicitly with `walgit compact --base` on a host
-  with sufficient disk. The rebuild uses a scratch copy under `<cache.dir>/_rebuild/`; serving files are not
-  rewritten. Ordinary geometric folds never touch a base or history pack (`--keep-pack`).
-- A base rebuild supersedes the captured live pack inventory, not just files git happened to delete.
-- Superseded packs are retained `compaction.retention_superseded` (provenance window) then GC'd.
+### 2.5 Pack lifecycle (WAL + git), leader by lease
+- Assigned maintainers classify committed packs, fold compatible fresh families geometrically, freeze
+  buffers by size or settlement, and re-segment by frozen-byte ratios under `leases/compact.pb`.
+  Classification and coverage repair do not rewrite ordinary scoped push packs. Folds incorporate only
+  geometrically comparable buffers; a large buffer does not move merely because enough tiny pushes arrived.
+- History/blob families and retained indexed objects share one ordinary ODB. Inputs are copied into an
+  isolated attempt under `<cache.dir>/_pack-lifecycle/`, with an owned reader pin and process lock.
+  Disk-backed inventories preserve indexed objects, including unreachable objects; Git recomputes deltas
+  from path-bearing object lists with explicit thread/window-memory limits. Full materialization and
+  input/output headroom are required, so large jobs need sufficient disk placement.
+- Plan/step receipts are disposable progress. Outputs publish additively; only the final seal retires
+  exact captured inputs, rechecking live descriptors and policy on each CAS attempt. An overlapping
+  output checksum stays live. Readers retain local files until their guards release. MIDX bitmaps over
+  the readable inventory are verified before use. `walgit compact --base` forces the same conserving cut.
+- Superseded pack records and bucket bytes remain indefinitely for issued downloads; there is no timed GC knob.
 
 ### 2.5b Self-healing by construction (D22)
 Everything the maintainer produces — checkpoints, compactions, integrity work and retention — derives from
 (config, WAL state). Each pass performs bounded useful work as a narrated task under the applicable lease.
-There are no bundle schedules. Manual base rebuilds remain separate during this migration phase.
+There are no bundle schedules or separate base-rebuild engine. Missing coverage requests proof repair,
+not a full cut; URI delivery remains a separately gated layer.
 
 ### 2.6 Packfile delivery target (D42)
 
@@ -411,6 +417,31 @@ Unrelated constraints remain in force. The current design target and migration g
   writer runs: older binaries do not enforce format-version fencing. This foundation alone does not emit URLs
   or prove object conservation; those require the lifecycle and transport layers described in D42.
 
+- **D44 (2026-09-11): One pack lifecycle configuration replaces compaction knobs.** `[packs]` owns
+  geometric factor/count/proportional bytes/age, minimum two fold inputs, size/settlement freeze, frozen-share
+  and re-segmentation ratios, target segment size, and bounded delta-search resources. The default 2 GiB is
+  a Git target, not an absolute bound on an oversized object. Resolve an explicit CPU-bounded thread count
+  and divide the host-clamped whole-operation window-memory budget before invoking Git. Native Git is the
+  only producer, so there is no engine selector. GNU sort/comm are runtime dependencies. Classification and
+  proof repair stay separate from expensive re-segmentation; a missing certificate does not justify a cut.
+  Host/new settings reject `[compaction]`. Saved bucket records alone may map enabled/factor/count/lease
+  fields and omit the old Git-only engine; any saved flat trigger or retention timeout disables pack work
+  with an explicit warning until an administrator rewrites settings. Conflicting old/new sections fail;
+  other overrides and raw history survive. Ordinary serving remains available. This supersedes older
+  compaction-configuration and timed pack-retention guidance, while lifecycle and URI evidence gates in
+  D42/D43 remain required. [Migration details](docs/PACKFILE_MIGRATION.md).
+
+- **D45 (2026-09-12): Conserving maintenance uses one staged lifecycle.** The current §2.5
+  supersedes the single-base rebuild and separate geometric producer descriptions in D18/D31.
+  Existing derived history packs remain readable durable data. New grouped history is authoritative,
+  not a disposable accelerator. Preserve the full indexed input set through retained families,
+  commit outputs additively, and retire exact inputs only at the final manifest CAS. Verify local
+  MIDX/bitmap identity and traversal; remote engines retain ordinary traversal when pack bytes are
+  absent. Shared code/meta objects may occupy one physical checksum with both memberships; code
+  eligibility still requires exact code-group proof. Scratch receipts and locks cannot establish
+  durable authority. This layer does not certify negotiated delivery, protected clients, model
+  refinement, or large-repository resource/performance acceptance.
+
 Decision identifiers are stable; gaps in the numbering are intentional.
 
 ---
@@ -446,7 +477,7 @@ Decision identifiers are stable; gaps in the numbering are intentional.
 - Web: pnpm + Vite, `pnpm run build` must pass oxlint/tsc. Config: `walgit.example.toml` documents every key;
   change it with the code.
 - Test tiers: `just test` (fast, < 1 min), `just e2e`, `just warnings`, `just clippy` (the
-  `[workspace.lints]` set, `-D warnings`), `just ci` = all four; the **simulation
+  `[workspace.lints]` set, `-D warnings`), `just ci` = all four plus `just sim` and `just smoke`; the **simulation
   suite** `cargo test -p walgit-server --test sim` (fault links per instance over one truth store: crash,
   partition, stale, lost response, orphan scenarios + randomized seeds `WALGIT_SIM_SEEDS`/`WALGIT_SIM_SEED`);
   `just test-slow` (ignored benches); `tests/e2e.sh` against a running server (`WALGIT_E2E_BASE_URL`,

@@ -68,7 +68,7 @@ function Tasks({ d, o, full }: { d: SettingsDescribe; o: Overview; full: string 
         <KV
           rows={[
             ["checkpoints", d.maintenance.checkpoints ? `on · every ${d.maintenance.interval_secs}s pass` : "off"],
-            ["compaction", d.compaction.enabled ? `on · trigger ${d.compaction.trigger_packs} packs / ${fmtBytes(d.compaction.trigger_bytes)}` : "off"],
+            ["pack maintenance", d.packs.enabled ? `on · fold threshold ${d.packs.fold_when_fresh_packs_reach} packs · segment target ${fmtBytes(d.packs.segment_max_bytes)}` : "off"],
             [
               "this instance",
               <span key="this-instance">
@@ -84,7 +84,7 @@ function Tasks({ d, o, full }: { d: SettingsDescribe; o: Overview; full: string 
         <div className="pad small muted">
           Who maintains a repository is a host rule (<code>[placement] maintain / maintain_exclude</code> + declared capacity), not a repository
           setting. Their recent maintenance work is on the <Link to={`/${full}/wal`}>WAL page</Link>; change
-          checkpoint settings or compaction triggers for <code>{full}</code> under “Effective config & history”.
+          checkpoint settings or pack maintenance for <code>{full}</code> under “Effective config & history”.
         </div>
       </Box>
     </>
@@ -351,7 +351,7 @@ function EffectiveConfig({ d, full }: { d: SettingsDescribe; full: string }) {
             spellCheck={false}
             rows={Math.min(24, Math.max(8, text.split("\n").length + 1))}
             value={text}
-            placeholder={"# TOML overrides of [refs], [packfile_uri], [maintenance], [compaction], [upstream]\n[compaction]\ntrigger_packs = 25\n"}
+            placeholder={"# TOML overrides of [refs], [packfile_uri], [maintenance], [packs], [upstream]\n[packs]\nfold_when_fresh_packs_reach = 25\n"}
             onChange={(e) => {
               setText(e.target.value);
               setDirty(true);

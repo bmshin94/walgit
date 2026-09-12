@@ -160,11 +160,15 @@ impl RemotePacks {
     ) -> Result<Self, WalError> {
         let dir = idx_dir(repo_dir);
         tokio::fs::create_dir_all(&dir).await?;
-        // History packs are always local copies: no remote index for them.
+        // Only redundant historical accelerators may be omitted. Authoritative
+        // history segments are the sole home of their objects on refs-only hosts.
         let manifest = {
             let mut m = manifest.clone();
-            m.packs
-                .retain(|p| p.kind != walgit_proto::v1::PackKind::History as i32);
+            m.packs.retain(|p| {
+                p.kind != walgit_proto::v1::PackKind::History as i32
+                    || !p.pack_groups.is_empty()
+                    || p.derived_from.is_empty()
+            });
             m
         };
         let manifest = &manifest;

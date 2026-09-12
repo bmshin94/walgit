@@ -81,3 +81,5 @@ jobs:
       - name: Build the SPA and the SDK
         run: just web-build
       - run: just e2e
+      - run: just sim
+      - run: just smoke

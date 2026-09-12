@@ -71,6 +71,81 @@ fn classify(
 }
 
 #[tokio::test]
+async fn replacement_seal_requires_exact_outputs_and_keeps_inputs_until_success() {
+    let store = MemoryStore::shared();
+    let dir = tempfile::tempdir().unwrap();
+    let registry = Registry::new(store.clone(), Arc::new(config(dir.path())));
+    let h = registry.create(&id(), ObjectFormat::Sha1).await.unwrap();
+    h.publish_settings("", "test", "generation").await.unwrap();
+    let mut manifest = (*h.manifest()).clone();
+    let mut input = pack(1);
+    input.pack_size = 100;
+    let mut output = pack(2);
+    output.pack_size = 80;
+    output.idx_size = 40;
+    output.object_count = 3;
+    output.published_at = Some(walgit_proto::time::now());
+    output.pack_groups = vec!["_retained".into()];
+    output.audience = PackAudience::Retained as i32;
+    output.ref_policy = h.effective_config().refs.policy_identity();
+    manifest.packs = vec![input.clone()];
+    manifest.revision += 1;
+    seed(&store, &manifest).await;
+    let captured = h.publication_view().await.unwrap();
+    // The producer commits output bytes additively before asking to retire inputs.
+    manifest.packs.push(output.clone());
+    manifest.revision += 1;
+    seed(&store, &manifest).await;
+    let lease = tokio::sync::Mutex::new(
+        walgit_store::coord::try_acquire(
+            store.clone(),
+            "test-seal-lease",
+            "test",
+            "seal",
+            std::time::Duration::from_mins(1),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+    );
+    let inputs = vec![input.checksum.clone()];
+    let mut wrong = output.clone();
+    wrong.idx_size += 1;
+    let error = h
+        .seal_pack_replacement(&captured, &inputs, &[wrong], &[], &lease)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("output descriptor changed"),
+        "{error}"
+    );
+    assert!(
+        h.manifest()
+            .packs
+            .iter()
+            .any(|p| p.checksum == input.checksum)
+    );
+    assert!(h.manifest().retired_packs.is_empty());
+    let seq = h
+        .seal_pack_replacement(&captured, &inputs, &[output.clone()], &[], &lease)
+        .await
+        .unwrap();
+    assert_eq!(h.manifest().packs, vec![output.clone()]);
+    assert!(
+        h.manifest()
+            .retired_packs
+            .iter()
+            .any(|p| p.checksum == input.checksum)
+    );
+    assert_eq!(
+        h.seal_pack_replacement(&captured, &inputs, &[output], &[], &lease)
+            .await
+            .unwrap(),
+        seq
+    );
+}
+
+#[tokio::test]
 async fn exact_snapshot_is_not_authority_until_cas_and_corruption_is_rejected() {
     let store = MemoryStore::shared();
     let d = tempfile::tempdir().unwrap();

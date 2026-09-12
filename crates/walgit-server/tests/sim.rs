@@ -156,8 +156,8 @@ fn sim_config(cache_dir: &Path) -> walgit_config::Config {
     cfg.wal.snapshot_every_entries = 0;
     cfg.wal.checkpoint_interval = Duration::ZERO;
     cfg.wal.checkpoint_tail_bytes = walgit_config::ByteSize::b(0);
-    cfg.compaction.lease_ttl = Duration::from_secs(2);
-    cfg.compaction.trigger_packs = 4;
+    cfg.packs.lease_ttl = Duration::from_secs(2);
+    cfg.packs.fold_when_fresh_packs_reach = 4;
     // The simulator exercises WAL publication, not derived-index CPU work.
     // History-pack/commit-graph builders can dominate tiny zero-latency store
     // runs and obscure the liveness bound without injecting another fault.
@@ -731,7 +731,6 @@ async fn check_core_liveness(
             bound,
             walgit_server::ops::compact_repo(
                 &h,
-                &c.instances[core[0]].cfg,
                 walgit_server::ops::CompactRequest {
                     force: true,
                     rebuild_base: false,
@@ -853,12 +852,10 @@ async fn run_safety_then_liveness(seed: u64) -> Result<()> {
             let i = rng.below_usize(n_instances);
             if let Ok(h) = c.instances[i].open(&c.id).await {
                 let _ = tokio::time::timeout(op_timeout, h.write_checkpoint()).await;
-                let cfg = c.instances[i].cfg.clone();
                 let _ = tokio::time::timeout(
                     op_timeout,
                     walgit_server::ops::compact_repo(
                         &h,
-                        &cfg,
                         walgit_server::ops::CompactRequest {
                             force: rng.chance(0.5),
                             rebuild_base: false,
@@ -998,7 +995,7 @@ async fn liveness_compaction_after_lease_holder_dies() -> Result<()> {
         &walgit_proto::keys::lease_key("compact"),
         "dead-instance",
         "compact",
-        c.instances[1].cfg.compaction.lease_ttl,
+        c.instances[1].cfg.packs.lease_ttl,
     )
     .await?
     .expect("lease free");
@@ -1010,7 +1007,6 @@ async fn liveness_compaction_after_lease_holder_dies() -> Result<()> {
     loop {
         let out = walgit_server::ops::compact_repo(
             &h0,
-            &c.instances[0].cfg,
             walgit_server::ops::CompactRequest {
                 force: true,
                 rebuild_base: false,
@@ -1024,7 +1020,7 @@ async fn liveness_compaction_after_lease_holder_dies() -> Result<()> {
                 ensure!(
                     t.elapsed() < Duration::from_secs(15),
                     "lease of a dead holder never expired (ttl {:?})",
-                    c.instances[0].cfg.compaction.lease_ttl
+                    c.instances[0].cfg.packs.lease_ttl
                 );
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
@@ -1277,7 +1273,6 @@ async fn liveness_orphaned_log_segment_does_not_block_writers() -> Result<()> {
     let h = c.instances[0].open(&c.id).await?;
     let out = walgit_server::ops::compact_repo(
         &h,
-        &c.instances[0].cfg,
         walgit_server::ops::CompactRequest {
             force: true,
             rebuild_base: false,
@@ -1357,7 +1352,6 @@ async fn liveness_cold_start_through_truncated_pack_reads() -> Result<()> {
     // Compaction on the healed instance works on what it downloaded.
     let out = walgit_server::ops::compact_repo(
         &h,
-        &c.instances[cold].cfg,
         walgit_server::ops::CompactRequest {
             force: true,
             rebuild_base: false,
@@ -1432,7 +1426,6 @@ async fn liveness_black_holed_instance_is_invisible_to_the_core() -> Result<()> 
         Duration::from_secs(20),
         walgit_server::ops::compact_repo(
             &h,
-            &c.instances[0].cfg,
             walgit_server::ops::CompactRequest {
                 force: true,
                 rebuild_base: false,
@@ -1530,12 +1523,10 @@ async fn liveness_checkpoint_racing_compaction() -> Result<()> {
     let h0 = c.instances[0].open(&c.id).await?;
     let h1 = c.instances[1].open(&c.id).await?;
     drop(h1.sync_full().await?);
-    let cfg = c.instances[1].cfg.clone();
     let (cp, compact) = tokio::join!(
         h0.write_checkpoint(),
         walgit_server::ops::compact_repo(
             &h1,
-            &cfg,
             walgit_server::ops::CompactRequest {
                 force: true,
                 rebuild_base: false
@@ -1706,6 +1697,11 @@ fn pack_objects(repo: &Path, checksum: &gix_hash::ObjectId) -> std::collections:
         .args(["verify-pack", "-v", idx.to_str().unwrap()])
         .output()
         .unwrap();
+    assert!(
+        out.status.success(),
+        "verify-pack failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|l| {
@@ -1737,7 +1733,6 @@ async fn seed_base_and_history(
     drop(h.sync_full().await?);
     let out = walgit_server::ops::compact_repo(
         &h,
-        &c.instances[i].cfg,
         walgit_server::ops::CompactRequest {
             force: true,
             rebuild_base: true,
@@ -1802,19 +1797,38 @@ async fn geometric_fold_never_touches_the_base_or_the_history_pack() -> Result<(
         .map(|x| x.checksum.clone())
         .collect();
     ensure!(fresh.len() >= 2, "{before:?}");
+    let mut expected_inventory = std::collections::HashSet::new();
+    for pack in &before.packs {
+        expected_inventory.extend(pack_objects(
+            h.local().path(),
+            &gix_hash::ObjectId::from_hex(pack.checksum.as_bytes())?,
+        ));
+    }
     let base_objects = pack_objects(h.local().path(), &base);
     ensure!(!base_objects.is_empty());
 
-    let out = walgit_server::ops::compact_repo(
-        &h,
-        &c.instances[i].cfg,
-        walgit_server::ops::CompactRequest {
-            force: true,
-            rebuild_base: false,
-        },
-        &walgit_server::ops::noop_log,
-    )
-    .await?;
+    // Classification and mixed-pack separation are independent bounded units.
+    // Keep running them until the compatible fresh family is actually folded.
+    let mut folded = None;
+    for _ in 0..16 {
+        let outcome = walgit_server::ops::compact_repo(
+            &h,
+            walgit_server::ops::CompactRequest {
+                force: true,
+                rebuild_base: false,
+            },
+            &walgit_server::ops::noop_log,
+        )
+        .await?;
+        if matches!(
+            outcome,
+            walgit_server::ops::CompactOutcome::Published { tier: 1, .. }
+        ) {
+            folded = Some(outcome);
+            break;
+        }
+    }
+    let out = folded.ok_or_else(|| anyhow!("no compatible family folded within 16 units"))?;
     let dbg = format!("{out:?}");
     let walgit_server::ops::CompactOutcome::Published {
         rebuild_base,
@@ -1850,16 +1864,20 @@ async fn geometric_fold_never_touches_the_base_or_the_history_pack() -> Result<(
             .any(|x| x.checksum == hist.to_hex().to_string()
                 && x.kind == walgit_proto::v1::PackKind::History as i32)
     );
-    for f in &fresh {
-        ensure!(
-            !live.contains(&f.as_str()),
-            "fresh pack {f} still live after the fold"
-        );
+    ensure!(
+        superseded >= 2,
+        "fold needs at least two compatible inputs: {dbg}"
+    );
+    let mut actual_inventory = std::collections::HashSet::new();
+    for pack in &after.packs {
+        actual_inventory.extend(pack_objects(
+            h.local().path(),
+            &gix_hash::ObjectId::from_hex(pack.checksum.as_bytes())?,
+        ));
     }
     ensure!(
-        superseded == fresh.len(),
-        "superseded {superseded}, fresh {}",
-        fresh.len()
+        actual_inventory == expected_inventory,
+        "fold changed committed object inventory"
     );
     // The folded pack carries none of the base's objects.
     for new in &packs {
@@ -1906,7 +1924,6 @@ async fn full_rebuild_leaves_exactly_one_base_even_with_a_retained_pack() -> Res
     let log_lines: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
     let out = walgit_server::ops::compact_repo(
         &h,
-        &c.instances[i].cfg,
         walgit_server::ops::CompactRequest {
             force: true,
             rebuild_base: true,
@@ -1949,7 +1966,10 @@ async fn full_rebuild_leaves_exactly_one_base_even_with_a_retained_pack() -> Res
             // The rebuild may reproduce an identical pack (same objects, same order): then it is the
             // new base, never a stale extra.
             ensure!(
-                fulls[0].checksum == *old,
+                after
+                    .packs
+                    .iter()
+                    .any(|pack| pack.checksum == *old && pack.tier == 2),
                 "old pack {old} still live next to the new base: {after:?}"
             );
         }
@@ -1964,7 +1984,7 @@ async fn full_rebuild_leaves_exactly_one_base_even_with_a_retained_pack() -> Res
 }
 
 // ---------------------------------------------------------------------------
-// Resumable base rebuild (BUNDLE_URI_DESIGN §5a)
+// Resumable isolated pack cuts
 // ---------------------------------------------------------------------------
 
 /// Run one rebuild attempt; returns (outcome, log lines).
@@ -1979,7 +1999,6 @@ async fn rebuild_attempt(
     };
     let out = walgit_server::ops::compact_repo(
         &h,
-        &c.instances[i].cfg,
         walgit_server::ops::CompactRequest {
             force: true,
             rebuild_base: true,
@@ -1990,20 +2009,15 @@ async fn rebuild_attempt(
     (out, lines.into_inner().unwrap())
 }
 
-/// A deploy (D31) kills the rebuild after any phase: the next unit resumes from the marker —
-/// across every phase boundary there is exactly **one** `git repack` in total — the serving copy
-/// is never rewritten (its pack files before publish are exactly the pre-rebuild ones), and the
-/// result is one base + one history pack. A push between the attempts makes the head move, and
-/// the next unit starts over (a second repack) instead of publishing a pack that lacks objects.
+/// Interrupted isolated cuts preserve the serving inventory and all committed
+/// objects. A changed ref snapshot rejects scratch from the previous cut.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::many_single_char_names)]
 async fn base_rebuild_resumes_after_a_kill_between_any_two_phases() -> Result<()> {
-    use walgit_server::rebuild::{Phase, TEST_ABORT_AFTER};
+    use walgit_server::pack_lifecycle::{Phase, TEST_ABORT_AFTER};
     let mut c = Cluster::new(33, 1).await?;
     let i = c.add_instance("ssd", &|cfg| {
         cfg.cache.mode = walgit_config::CacheMode::Disk;
-        cfg.git.history_pack = true;
-        cfg.git.commit_graph = true;
     });
     let mut p = Pusher::new(0);
     for _ in 0..4 {
@@ -2014,144 +2028,106 @@ async fn base_rebuild_resumes_after_a_kill_between_any_two_phases() -> Result<()
     }
     let h = c.instances[i].open(&c.id).await?;
     drop(h.sync_full().await?);
+    let before = h.manifest();
     let before_files: std::collections::BTreeSet<String> =
         std::fs::read_dir(h.local().path().join("objects/pack"))?
             .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
             .collect();
+    let mut expected = std::collections::HashSet::new();
+    for pack in &before.packs {
+        expected.extend(pack_objects(
+            h.local().path(),
+            &gix_hash::ObjectId::from_hex(pack.checksum.as_bytes())?,
+        ));
+    }
     let repo_key = c.id.to_string();
-    let mut repacks = 0usize;
-    // Kill after each phase in turn; every attempt but the last fails by the hook.
-    for phase in [
-        Phase::Copied,
-        Phase::Repacked,
-        Phase::HistoryPack,
-        Phase::CommitGraph,
-    ] {
+    for phase in [Phase::Prepared, Phase::Step] {
         *TEST_ABORT_AFTER.lock() = Some((repo_key.clone(), phase));
         let (out, log) = rebuild_attempt(&c, i).await;
-        repacks += log.iter().filter(|l| l.starts_with("repack done")).count();
         ensure!(
             out.is_err(),
-            "attempt killed after {phase:?} should fail: {out:?}\n{}",
+            "attempt killed after {phase:?}: {out:?}\n{}",
             log.join("\n")
         );
-        // The serving copy is untouched while the rebuild is in flight.
         let now_files: std::collections::BTreeSet<String> =
             std::fs::read_dir(h.local().path().join("objects/pack"))?
                 .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
                 .collect();
         ensure!(
             now_files == before_files,
-            "serving copy changed during the rebuild after {phase:?}: {now_files:?} vs {before_files:?}"
+            "serving files changed before publication"
         );
-        // "Restart": a fresh instance on the same cache dir/link name — the scratch dir on "disk" survives.
-        c.restart_keep_disk(i, &|cfg| {
-            cfg.cache.mode = walgit_config::CacheMode::Disk;
-            cfg.git.history_pack = true;
-            cfg.git.commit_graph = true;
-        });
+        ensure!(
+            h.manifest().packs == before.packs,
+            "inputs changed before final seal"
+        );
+        c.restart_keep_disk(i, &|cfg| cfg.cache.mode = walgit_config::CacheMode::Disk);
     }
     *TEST_ABORT_AFTER.lock() = None;
     let (out, log) = rebuild_attempt(&c, i).await;
-    repacks += log.iter().filter(|l| l.starts_with("repack done")).count();
-    let out = out.with_context(|| log.join("\n"))?;
-    ensure!(
-        matches!(
-            out,
-            walgit_server::ops::CompactOutcome::Published {
-                rebuild_base: true,
-                ..
-            }
-        ),
-        "{out:?}"
-    );
-    ensure!(
-        repacks == 1,
-        "exactly one git repack across all attempts, saw {repacks}:\n{}",
-        log.join("\n")
-    );
-    ensure!(
-        log.iter().any(|l| l.starts_with("resuming base rebuild")),
-        "{}",
-        log.join("\n")
-    );
-    let h = c.instances[i].open(&c.id).await?;
-    drop(h.sync_full().await?);
-    let m = h.manifest();
-    ensure!(
-        m.packs
-            .iter()
-            .filter(|x| x.tier == 2 && x.kind != walgit_proto::v1::PackKind::History as i32)
-            .count()
-            == 1,
-        "{m:?}"
-    );
-    ensure!(
-        m.packs
-            .iter()
-            .filter(|x| x.kind == walgit_proto::v1::PackKind::History as i32)
-            .count()
-            == 1,
-        "{m:?}"
-    );
-    ensure!(m.packs.len() == 2, "{m:?}");
-    let scratch = c.instances[i].cfg.cache.dir.join("_rebuild");
-    ensure!(
-        !scratch.join("sim").exists() || std::fs::read_dir(scratch.join("sim"))?.next().is_none(),
-        "scratch dir left behind"
-    );
-    check_truth(&c, std::slice::from_ref(&p)).await?;
-
-    // A push between a kill and the resume: the head moved, the next attempt starts over.
-    *TEST_ABORT_AFTER.lock() = Some((repo_key.clone(), Phase::Repacked));
-    let (out, log1) = rebuild_attempt(&c, i).await;
-    ensure!(out.is_err());
-    ensure!(log1.iter().filter(|l| l.starts_with("repack done")).count() == 1);
-    ensure!(
-        p.push_once(&c.instances[i], &c.id, Duration::from_secs(10))
-            .await?
-    );
-    *TEST_ABORT_AFTER.lock() = None;
-    let (out, log2) = rebuild_attempt(&c, i).await;
-    let out = out.with_context(|| log2.join("\n"))?;
     ensure!(matches!(
-        out,
+        out.with_context(|| log.join("\n"))?,
         walgit_server::ops::CompactOutcome::Published {
             rebuild_base: true,
             ..
         }
     ));
     ensure!(
-        log2.iter()
-            .any(|l| l.starts_with("discarding interrupted base rebuild")),
+        log.iter()
+            .any(|line| line.contains("resumed validated pack lifecycle progress")),
         "{}",
-        log2.join("\n")
-    );
-    ensure!(
-        log2.iter().filter(|l| l.starts_with("repack done")).count() == 1,
-        "a fresh repack after the head moved"
+        log.join("\n")
     );
     let h = c.instances[i].open(&c.id).await?;
     drop(h.sync_full().await?);
-    let m = h.manifest();
+    let mut actual = std::collections::HashSet::new();
+    for pack in &h.manifest().packs {
+        actual.extend(pack_objects(
+            h.local().path(),
+            &gix_hash::ObjectId::from_hex(pack.checksum.as_bytes())?,
+        ));
+    }
     ensure!(
-        m.packs.len() == 2,
-        "one base + one history pack again: {m:?}"
+        actual == expected,
+        "cut changed the committed object inventory"
     );
-    // The pushed commit is in the new base (not lost to a stale scratch).
-    let base = m
-        .packs
-        .iter()
-        .find(|x| x.tier == 2 && x.kind != walgit_proto::v1::PackKind::History as i32)
-        .unwrap();
-    let objs = pack_objects(
-        h.local().path(),
-        &gix_hash::ObjectId::from_hex(base.checksum.as_bytes())?,
-    );
+    check_truth(&c, std::slice::from_ref(&p)).await?;
+
+    *TEST_ABORT_AFTER.lock() = Some((repo_key.clone(), Phase::Step));
+    let (out, _) = rebuild_attempt(&c, i).await;
+    ensure!(out.is_err());
     ensure!(
-        objs.contains(&p.tip),
-        "the in-between push's tip {} is in the new base",
-        p.tip
+        p.push_once(&c.instances[i], &c.id, Duration::from_secs(10))
+            .await?
+    );
+    *TEST_ABORT_AFTER.lock() = None;
+    let (out, log) = rebuild_attempt(&c, i).await;
+    ensure!(matches!(
+        out.with_context(|| log.join("\n"))?,
+        walgit_server::ops::CompactOutcome::Published {
+            rebuild_base: true,
+            ..
+        }
+    ));
+    ensure!(
+        log.iter()
+            .any(|line| line.starts_with("scratch cannot resume")),
+        "{}",
+        log.join("\n")
+    );
+    let h = c.instances[i].open(&c.id).await?;
+    drop(h.sync_full().await?);
+    let mut actual = std::collections::HashSet::new();
+    for pack in &h.manifest().packs {
+        actual.extend(pack_objects(
+            h.local().path(),
+            &gix_hash::ObjectId::from_hex(pack.checksum.as_bytes())?,
+        ));
+    }
+    ensure!(actual.contains(&p.tip), "the in-between push was lost");
+    ensure!(
+        expected.is_subset(&actual),
+        "previously committed objects were lost"
     );
     check_truth(&c, std::slice::from_ref(&p)).await?;
     Ok(())

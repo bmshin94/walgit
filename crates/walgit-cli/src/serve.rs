@@ -2,7 +2,7 @@
 //!
 //! Opens the object store and constructs the WAL registry, authenticator,
 //! semaphores and metrics. The maintain role runs bounded maintenance tasks
-//! and upstream following; otherwise the compact role runs geometric compaction.
+//! and upstream following; otherwise the compact role runs bounded pack lifecycle units.
 
 use std::sync::Arc;
 
@@ -83,20 +83,20 @@ pub async fn run(cfg: &Arc<Config>) -> Result<()> {
 
 /// Compaction loop: every 60s, check each repo for compaction triggers.
 async fn compact_loop(registry: Arc<walgit_wal::Registry>, cfg: Arc<Config>) {
-    if !cfg.compaction.enabled {
-        info!("compaction disabled by config, loop exiting");
+    if !cfg.packs.enabled {
+        info!("pack maintenance disabled by config, loop exiting");
         return;
     }
     let interval = std::time::Duration::from_mins(1);
     loop {
         tokio::time::sleep(interval).await;
-        if let Err(e) = run_compaction_pass(&registry, &cfg).await {
+        if let Err(e) = run_compaction_pass(&registry).await {
             warn!(error = %e, "compaction pass failed");
         }
     }
 }
 
-async fn run_compaction_pass(registry: &walgit_wal::Registry, cfg: &Config) -> anyhow::Result<()> {
+async fn run_compaction_pass(registry: &walgit_wal::Registry) -> anyhow::Result<()> {
     let repos = registry.list().await?;
     for id in repos {
         let handle = match registry.open(&id).await {
@@ -114,7 +114,6 @@ async fn run_compaction_pass(registry: &walgit_wal::Registry, cfg: &Config) -> a
         let log = |line: String| info!(repo = %id, "{line}");
         match walgit_server::ops::compact_repo(
             &handle,
-            cfg,
             walgit_server::ops::CompactRequest::default(),
             &log,
         )

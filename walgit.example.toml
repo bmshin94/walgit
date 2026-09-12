@@ -143,15 +143,25 @@ serve_exclude = []                # … except these: 503 + Retry-After before a
 maintain = ["*"]                  # maintainer units here (with roles ∋ maintain): checkpoints, compaction, fsck/repair …
 maintain_exclude = []             # … except these
 
-[compaction]
+[packs]
 enabled = true
-factor = 2                        # geometric repack factor
-trigger_packs = 16                # compact when this many tier-0 packs exist
-trigger_bytes = "1GiB"            # or when tier-0 pack bytes exceed this (either way: at least 2 fresh packs; the base/history
-                                  # pack are never folded; a base is rebuilt only by `walgit compact --base`)
-lease_ttl = "10m"                 # compaction lease TTL
-retention_superseded = "7d"       # keep old packs for provenance / rewind
-engine = "git"                    # "git" (gix cannot delta-compress)
+geometric_factor = 2              # fold compatible fresh pack families independently
+fold_when_fresh_packs_reach = 16
+fold_when_max_age = "1d"           # zero disables the age arm
+fold_needs_at_least_packs = 2      # never fold one pack into itself
+                                  # byte trigger: max(live bytes / geometric_factor², packfile_uri.uri_min_bytes)
+segment_max_bytes = "2GiB"         # Git target, not an absolute cap for an oversized single object
+segment_target_bytes = "0B"        # zero derives from segment_max_bytes; otherwise 1MiB..=max
+segment_delta_window = 250
+segment_delta_depth = 50
+segment_delta_window_memory = "2GiB" # whole-operation budget, divided over explicit resolved threads
+segment_reuse_objects = true       # reuse compressed undeltified objects; whole cuts recompute deltas
+segment_threads = 0                # resolve available CPUs before invoking Git; host memory also clamps
+freeze_when_settled = "14d"         # useful fold freezes after settlement; zero disables age arm
+frozen_coverage_target = 0.75       # 0 disables first-freeze coverage trigger
+resegment_when_frozen_folds_exceed = 0.5 # fold-derived frozen bytes / previous global-cut bytes
+lease_ttl = "10m"
+# Retired pack bytes and URL authority have no time-based retention knob.
 
 [lfs]
 enabled = true

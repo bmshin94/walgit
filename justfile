@@ -131,7 +131,16 @@ clippy:
     {{t15}} cargo clippy --workspace --all-targets -- -D warnings
 
 # Everything that must be green before a merge (what CI runs).
-ci: warnings clippy test e2e
+ci: warnings clippy test e2e sim smoke
+
+# Fault injection and recovery share process-wide test hooks; run serially.
+sim:
+    {{t15}} cargo test -p walgit-server --test sim -- --test-threads=1
+
+# Standalone CLI/server against memory; add WALGIT_TEST_S3_ENDPOINT for the local rig.
+smoke:
+    {{t15}} cargo build -p walgit-cli
+    WALGIT="$(realpath "${CARGO_TARGET_DIR:-target}/debug/walgit")" {{t15}} tests/e2e.sh
 
 # Slow tier: #[ignore]d benches/soaks (20k-ref push, 466k-ref render, ...).
 test-slow:

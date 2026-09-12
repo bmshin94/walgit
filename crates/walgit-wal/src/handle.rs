@@ -46,7 +46,7 @@ pub struct RepoHandle {
 
     // Prevents pack removal during reads. Uses tokio::sync::RwLock because
     // guards are held across .await points (freshness check, apply_delta).
-    pub(crate) rw: TokioRwLock<()>,
+    pub(crate) rw: Arc<TokioRwLock<()>>,
     // Single in-flight sync.
     pub(crate) sync_mutex: TokioMutex<()>,
     /// Serializes pack reconciliation (downloads/links/removals). Held
@@ -149,7 +149,7 @@ impl RepoHandle {
             local,
             store,
             cfg,
-            rw: TokioRwLock::new(()),
+            rw: Arc::new(TokioRwLock::new(())),
             sync_mutex: TokioMutex::new(()),
             pack_mutex: TokioMutex::new(()),
             manifest: PLRwLock::new(Arc::new(manifest)),
@@ -420,6 +420,13 @@ impl RepoHandle {
     /// Like [`sync`] but every pack is a real local copy (base rebuilds,
     /// bundle builds and anything else that streams whole packs). Refused with
     /// `TooLarge` when the set does not fit `cache.max_bytes`.
+    /// Pin installed object files across an owned blocking maintenance task.
+    /// Unlike a borrowed request guard, cancellation of its caller cannot release
+    /// this pin while a detached blocking worker still copies the input files.
+    pub async fn pin_local_objects(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
+        self.rw.clone().read_owned().await
+    }
+
     pub async fn sync_full(&self) -> Result<crate::sync::ReadGuard<'_>, WalError> {
         self.sync_level(SyncLevel::Full).await
     }
@@ -764,7 +771,9 @@ impl RepoHandle {
             .map(|p| {
                 // History packs (commits + trees of a base) are always local:
                 // that is the point of them.
-                let how = if p.tier != 2 || p.kind == walgit_proto::v1::PackKind::History as i32 {
+                let redundant_history = p.kind == walgit_proto::v1::PackKind::History as i32
+                    && p.pack_groups.is_empty() && !p.derived_from.is_empty();
+                let how = if p.tier != 2 || redundant_history {
                     PackPlan::Local
                 } else if let Some(m) = mount.as_ref() {
                     let target = crate::sync::mount_pack_path(m, &p.checksum);
@@ -1112,19 +1121,56 @@ impl RepoHandle {
         let rev = manifest.settings.as_ref().map_or(0, |s| s.revision);
         // Bucket-data compatibility, deliberately absent from Config::with_settings:
         // host files and new settings writes must reject the removed section.
-        let migrated = (toml.len() <= walgit_config::SETTINGS_MAX_BYTES)
-            .then(|| toml.parse::<toml::Table>().ok())
-            .flatten()
-            .and_then(|mut doc| {
-                if !matches!(doc.get("bundles"), Some(toml::Value::Table(_))) {
-                    return None;
-                }
+        let mut migrated = None;
+        if toml.len() <= walgit_config::SETTINGS_MAX_BYTES
+            && let Ok(mut doc) = toml.parse::<toml::Table>()
+        {
+            let mut changed = false;
+            if matches!(doc.get("bundles"), Some(toml::Value::Table(_))) {
                 doc.remove("bundles");
-                Some(doc.to_string())
-            });
-        if migrated.is_some() {
-            tracing::warn!(repo = %self.id, revision = rev,
-                "migrating saved repo settings for bundle removal: ignoring [bundles] in effective config; durable settings and history are unchanged");
+                changed = true;
+                tracing::warn!(repo = %self.id, revision = rev,
+                    "migrating saved repo settings: ignoring obsolete [bundles]; durable settings and history are unchanged");
+            }
+            if let Some(toml::Value::Table(old)) = doc.get("compaction").cloned() {
+                if doc.contains_key("packs") {
+                    return Err(WalError::Invalid("saved settings contain both [compaction] and [packs]; explicit administrator rewrite required".into()));
+                }
+                let mut packs = toml::Table::new();
+                let mut disabled = false;
+                for (key, value) in old {
+                    let target = match key.as_str() {
+                        "enabled" => "enabled",
+                        "factor" => "geometric_factor",
+                        "trigger_packs" => "fold_when_fresh_packs_reach",
+                        "lease_ttl" => "lease_ttl",
+                        "trigger_bytes" | "retention_superseded" => {
+                            disabled = true;
+                            continue;
+                        }
+                        "engine" if value.as_str() == Some("git") => continue,
+                        _ => {
+                            return Err(WalError::Invalid(format!(
+                                "saved compaction setting {key} cannot be migrated; administrator rewrite required"
+                            )));
+                        }
+                    };
+                    packs.insert(target.to_string(), value);
+                }
+                if disabled {
+                    packs.insert("enabled".into(), toml::Value::Boolean(false));
+                    tracing::warn!(repo = %self.id, revision = rev,
+                        "saved compaction byte/retention policy has no safe pack-lifecycle mapping; packs disabled until administrator rewrites settings");
+                }
+                doc.remove("compaction");
+                doc.insert("packs".into(), toml::Value::Table(packs));
+                changed = true;
+                tracing::warn!(repo = %self.id, revision = rev,
+                    "migrating supported saved [compaction] settings to [packs]; durable settings and history are unchanged");
+            }
+            if changed {
+                migrated = Some(doc.to_string());
+            }
         }
         self.cfg
             .with_settings(migrated.as_deref().unwrap_or(toml))
@@ -1176,6 +1222,73 @@ impl RepoHandle {
         history_of: Option<String>,
     ) -> Result<u64, WalError> {
         crate::publish::add_pack_impl(self, pack, idx, tier, history_of).await
+    }
+
+    /// Publish a verified maintenance output additively. Its descriptor is
+    /// explicit: local directory scans may include rejected or concurrent work.
+    /// The caller retains the isolated input until the final replacement seal.
+    pub async fn publish_prepared_pack(
+        &self,
+        path: &std::path::Path,
+        descriptor: &walgit_proto::v1::PackRef,
+        classification: crate::PackClassification,
+    ) -> Result<u64, WalError> {
+        let checksum = gix_hash::ObjectId::from_hex(descriptor.checksum.as_bytes())
+            .map_err(|e| WalError::Invalid(format!("output checksum: {e}")))?;
+        // install_pack moves its input; preserve resumable scratch receipts by
+        // installing copies owned by a short-lived staging directory.
+        let source = path.to_path_buf();
+        let desc = descriptor.clone();
+        let staging = tokio::task::spawn_blocking(move || -> Result<_, std::io::Error> {
+            let dir = tempfile::tempdir()?;
+            for (present, extension) in [
+                (true, "pack"),
+                (true, "idx"),
+                (desc.has_rev, "rev"),
+                (desc.has_bitmap, "bitmap"),
+                (desc.has_commit_graph, "commit-graph"),
+            ] {
+                if present {
+                    std::fs::copy(
+                        source.with_extension(extension),
+                        dir.path()
+                            .join(format!("pack-{}.{}", desc.checksum, extension)),
+                    )?;
+                }
+            }
+            Ok(dir)
+        })
+        .await
+        .map_err(|e| WalError::Invalid(format!("output staging: {e}")))??;
+        let path = staging
+            .path()
+            .join(format!("pack-{}.pack", descriptor.checksum));
+        let mut extras = Vec::new();
+        for (present, extension) in [
+            (descriptor.has_rev, "rev"),
+            (descriptor.has_bitmap, "bitmap"),
+            (descriptor.has_commit_graph, "commit-graph"),
+        ] {
+            if present {
+                extras.push(path.with_extension(extension));
+            }
+        }
+        self.local
+            .install_pack(&path, &path.with_extension("idx"), &extras)
+            .await?;
+        let info = walgit_git::PackInfo {
+            checksum,
+            pack_size: descriptor.pack_size,
+            idx_size: descriptor.idx_size,
+            object_count: descriptor.object_count,
+            has_rev: descriptor.has_rev,
+            has_bitmap: descriptor.has_bitmap,
+            has_commit_graph: descriptor.has_commit_graph,
+            history_of: (!descriptor.derived_from.is_empty())
+                .then(|| descriptor.derived_from.clone()),
+        };
+        self.publish_compact_covering(info, Vec::new(), descriptor.tier, &classification, &[])
+            .await
     }
 
     /// Whether the last known manifest wants a checkpoint, and why.
