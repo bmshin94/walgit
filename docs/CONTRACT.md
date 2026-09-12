@@ -23,7 +23,9 @@ Read `AGENTS.md` first (design §1–§2, decisions §3; the original layout/pha
   `ObjectStoreExt`, `Prefixed`, `memory::MemoryStore`, `util::{collect,once,file_stream,backoff,retry}`),
   placeholder modules `coord.rs`, `gcs.rs`, `s3.rs`.
 - `walgit-config`: `Config` for walgit.toml (+ `WALGIT__` env overrides, `PORT`); `Config::with_settings` accepts
-  only `[maintenance]`, `[compaction]` and `[upstream]` in repo-scoped settings.
+  only `[maintenance]`, `[packs]`, `[upstream]`, `[refs]` and `[packfile_uri]` in repo-scoped settings.
+  `PacksConfig` owns lifecycle thresholds and whole-operation memory budgets; removed compaction keys are
+  rejected on host/new-write paths. Durable-only transition rules live in `PACKFILE_MIGRATION.md`.
 
 ## walgit-git (owner: GitEngine)
 

@@ -22,6 +22,10 @@ unproven requests continue through dynamic Git transfer.
 Ref advertisement chooses names to show. Named object groups choose logical reachability. History/blob
 segments choose physical object types. These policies must not be conflated or treated as access controls.
 All outputs belong to the same ordinary Git object database.
+Identical physical packs are stored once and can belong to both code and metadata groups. Shared objects
+already reachable through a code group are ordinary code data; metadata-only objects must never enter its
+coverage. Such a shared pack carries a code audience label, but only an exact code-group certificate can
+make it eligible for ordinary URI delivery. Labels alone grant neither access nor coverage.
 
 Group configuration (available in the coverage foundation; transport wiring follows separately):
 
@@ -87,9 +91,15 @@ families into tier-1 buffers, excluding frozen packs. Size or settlement freezes
 history and blob segments. Ratio-driven re-segmentation improves the global layout when sufficient new
 frozen material accumulates. A manual base operation uses the same mechanism; there is no weekly trigger.
 
-Proposed defaults include factor 2, 16 fresh packs, a one-day age arm requiring at least two packs, 14-day
+Lifecycle defaults include factor 2, 16 fresh packs, a one-day age arm requiring at least two packs, 14-day
 settlement, a 75% frozen target and a 0.5 re-segmentation ratio. Fresh-byte thresholds scale with repository
 size and the delivery floor. Missing scope classification or certificates is repaired independently.
+
+`[packs]` is the lifecycle configuration; `walgit.example.toml` documents every field. No alternate engine
+selector or retired-object timeout exists. Delta-search threads are resolved explicitly before invoking Git;
+zero configured threads means CPU detection, never an uncontrolled `--threads=0` subprocess. The whole-operation
+window-memory budget is clamped to host headroom and divided over the resolved thread count. GNU `sort` and
+`comm` provide bounded on-disk inventory operations; packaged runtimes include GNU coreutils.
 
 History contains commits, trees and tags; blobs have separate segments. Each segment is independently
 indexable, with all delta bases inside the pack. Git graph dependencies may cross segments and must be proved.

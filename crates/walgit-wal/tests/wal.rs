@@ -2221,8 +2221,8 @@ async fn test_repo_settings_publish_and_effective_config() {
     let handle = registry.create(&id, ObjectFormat::Sha1).await.unwrap();
     assert!(handle.settings().is_none());
     assert_eq!(
-        handle.effective_config().compaction.factor,
-        make_config(cache.path(), 0).compaction.factor
+        handle.effective_config().packs.geometric_factor,
+        make_config(cache.path(), 0).packs.geometric_factor
     );
 
     // Rejected: forbidden section; unknown key.
@@ -2241,12 +2241,12 @@ async fn test_repo_settings_publish_and_effective_config() {
 
     // Accepted.
     let rev = handle
-        .publish_settings("[compaction]\nfactor = 3\n", "alice", "small repo")
+        .publish_settings("[packs]\ngeometric_factor = 3\n", "alice", "small repo")
         .await
         .unwrap();
     assert_eq!(rev, 1);
     assert_eq!(handle.manifest().head_seq, 1);
-    assert_eq!(handle.effective_config().compaction.factor, 3);
+    assert_eq!(handle.effective_config().packs.geometric_factor, 3);
     let log = handle.read_log(1, None).await.unwrap();
     assert_eq!(log[0].kind(), walgit_proto::v1::EntryKind::Settings);
     assert_eq!(log[0].settings.as_ref().unwrap().author, "alice");
@@ -2257,24 +2257,24 @@ async fn test_repo_settings_publish_and_effective_config() {
     let h2 = registry2.open(&id).await.unwrap();
     h2.sync_refs().await.unwrap();
     assert_eq!(h2.settings().unwrap().revision, 1);
-    assert_eq!(h2.effective_config().compaction.factor, 3);
+    assert_eq!(h2.effective_config().packs.geometric_factor, 3);
 
     // Second publish bumps the revision; clearing restores the host config.
     assert_eq!(
         handle
-            .publish_settings("[compaction]\nfactor = 9\n", "alice", "")
+            .publish_settings("[packs]\ngeometric_factor = 9\n", "alice", "")
             .await
             .unwrap(),
         2
     );
-    assert_eq!(handle.effective_config().compaction.factor, 9);
+    assert_eq!(handle.effective_config().packs.geometric_factor, 9);
     assert_eq!(
         handle.publish_settings("", "alice", "clear").await.unwrap(),
         3
     );
     assert_eq!(
-        handle.effective_config().compaction.factor,
-        make_config(cache.path(), 0).compaction.factor
+        handle.effective_config().packs.geometric_factor,
+        make_config(cache.path(), 0).packs.geometric_factor
     );
 }
 
@@ -2288,12 +2288,15 @@ async fn test_repo_settings_bundle_removal_replays_without_losing_overrides() {
     let registry = Registry::new(store.clone(), Arc::new(make_config(cache.path(), 0)));
     let id = repo_id("test", "saved-settings");
     let handle = registry.create(&id, ObjectFormat::Sha1).await.unwrap();
-    let supported = "[compaction]\nfactor = 3\n[upstream]\ngit = \"https://git.example.com/acme/source.git\"\nfollow = [\"refs/heads/release\"]\n";
+    let supported = "[packs]\ngeometric_factor = 3\n[upstream]\ngit = \"https://git.example.com/acme/source.git\"\nfollow = [\"refs/heads/release\"]\n";
     handle
         .publish_settings(supported, "alice", "preserve scope")
         .await
         .unwrap();
-    let saved = format!("# Historical configuration\n[bundles]\nenabled = false\n{supported}");
+    let saved = format!(
+        "# Historical configuration\n[bundles]\nenabled = false\n{}",
+        supported.replace("[packs]\ngeometric_factor", "[compaction]\nfactor")
+    );
 
     // Encode the manifest and log as an older writer did. New writes cannot
     // introduce this document, so seed persisted bytes rather than a shim API.
@@ -2326,7 +2329,7 @@ async fn test_repo_settings_bundle_removal_replays_without_losing_overrides() {
     let replayed = reader.open(&id).await.unwrap();
     replayed.sync_refs().await.unwrap();
     let effective = replayed.effective_config();
-    assert_eq!(effective.compaction.factor, 3);
+    assert_eq!(effective.packs.geometric_factor, 3);
     assert_eq!(
         effective.upstream.git.as_deref(),
         Some("https://git.example.com/acme/source.git")

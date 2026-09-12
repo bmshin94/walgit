@@ -28,10 +28,11 @@ Remove `[bundles]` and every `[[bundles.strategy]]` table, `server.roles` entrie
 that warn and ignore unknown keys are not migration tools: remove corresponding `WALGIT__BUNDLES__*` and
 cache overrides from the host's deployment configuration as well.
 
-The removal unit retains `[compaction]` and the ordinary `compact` role. LFS `serve_via = "proxy"` or
-`"signed_url"` is unchanged; its Rust type is independently named `LfsServe`. The later lifecycle change will
-introduce `[packs]` and explicit delivery/group configuration. Do not rename compaction keys mechanically:
-size/age/ratio semantics must be reviewed, and proposed design examples are not accepted removal-unit config.
+The lifecycle layer replaces `[compaction]` with `[packs]`; old host keys and newly submitted old settings
+are rejected. The ordinary `compact` role remains. LFS `serve_via = "proxy"` or `"signed_url"` is unchanged.
+Use the documented lifecycle fields in `walgit.example.toml`: factor/count/age triggers, settlement freeze,
+ratio-driven re-segmentation, and bounded delta-search resources. There is no engine selector (Git performs
+packing), flat `trigger_bytes`, or `retention_superseded` knob. Remove corresponding old environment overrides.
 
 Use `walgit config check` with the actual host configuration/environment before restart. Compare rendered
 effective placement, auth, maintenance and upstream settings to the intended values.
@@ -44,7 +45,7 @@ visibility/object scope by falling back to broad host defaults.
 
 Before replacing old readers/writers, inspect each repository's saved settings and save its full document,
 revision and effective configuration. Using the existing administrative settings API/CLI, publish a reviewed
-replacement document that removes only bundle-specific sections while preserving maintenance, compaction,
+replacement document that removes only bundle-specific sections while preserving maintenance,
 upstream and all other still-supported intent. For example:
 
 ```toml
@@ -72,6 +73,30 @@ replacement document remains the explicit durable migration. A warning followed 
 and using broad host defaults does not meet the gate.
 Historical SETTINGS entries stay intact and replayable; no bucket-wide rewriting or log mutation is authorized.
 Rollback/replay to a historical settings revision must apply the same transition checks before object work.
+
+## Saved compaction settings
+
+The lifecycle layer has a bounded read transition for old durable documents only. It preserves the raw saved
+record and maps supported intent into the effective config:
+
+| Saved compaction key | Effective packs key |
+|---|---|
+| enabled | enabled |
+| factor | geometric_factor |
+| trigger_packs | fold_when_fresh_packs_reach |
+| lease_ttl | lease_ttl |
+| engine = "git" | removed; native Git is the only producer |
+
+Old flat byte triggers do not have the same meaning as proportional fold thresholds. Time-limited retired
+pack retention contradicts issued-URL safety. If saved `trigger_bytes` or `retention_superseded` is present,
+the transition **disables pack maintenance** and warns until an administrator publishes reviewed `[packs]`
+settings. Ordinary serving remains available. It never guesses a size threshold or starts pruning objects.
+
+A document containing both old `[compaction]` and new `[packs]` fails validation rather than overwriting either
+one. Mapped fields must pass current validation; unsupported old values require an explicit rewrite. Other
+settings, including narrow ref selectors and upstream settings, remain intact. Preview the full replacement,
+publish through the settings API/CLI and verify the stored revision and effective values. This is bucket-data
+compatibility, not a host-config alias. Historical entries are never rewritten.
 
 ## Durable schema and writer cutover
 

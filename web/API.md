@@ -265,7 +265,7 @@ removes it (admin permission) — the same handlers as `PUT|DELETE /{owner}/{rep
 `GET|PUT|DELETE …/policy` is the push policy document (`docs/POLICY.md`).
 
 `GET|PUT|DELETE /{o}/{r}/api/settings` (D24, 2026-08-21) is the repository's **settings in the WAL**: a TOML document
-restricted to `[refs]`, `[packfile_uri]`, `[maintenance]`, `[compaction]` and `[upstream]`, merged over the
+restricted to `[refs]`, `[packfile_uri]`, `[maintenance]`, `[packs]` and `[upstream]`, merged over the
 host's config (`effective config`).
 `GET` → `{revision, author, updated_at, message, toml}` (`revision: 0` = none). `PUT` body = the TOML
 (`?message=` optional), validated against the serving host's build — 400 with the reason and nothing published
@@ -279,7 +279,7 @@ inline on `manifest.pb`). CLI: `walgit repo settings show|set|clear|history`.
 
 Settings tab helpers (`/{o}/{r}/api/settings…`, all `no-store`): `GET …/settings/describe` → `{settings, sections,
 maintenance:
-{checkpoints,interval_secs,this_host:{name,serves,maintains,disk,max_pack_bytes,cache_budget_bytes,roles}}, compaction,
+{checkpoints,interval_secs,this_host:{name,serves,maintains,disk,max_pack_bytes,cache_budget_bytes,roles}}, packs{enabled,fold_when_fresh_packs_reach,fold_when_max_age_secs,segment_max_bytes,freeze_when_settled_secs},
 upstream:{git,lfs,token_env:bool,follow:[refs],follow_interval_secs,last_round:{at,outcome: in-sync|published|refused|failed,
 detail,upstream:{ref:oid},ours:{ref:oid}}|null} (D33; last_round = this instance's last follow round),
 fields:[{key,value,host_value,source: host|setting}], head_seq}`; `POST …/settings/validate` (body TOML) → the same

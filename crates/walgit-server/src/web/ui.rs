@@ -660,27 +660,16 @@ async fn overview(
             ),
         });
     }
-    let has_bitmap_base = manifest.packs.iter().any(|p| p.tier == 2 && p.has_bitmap);
     let fresh = manifest.packs.iter().filter(|p| p.tier == 0).count();
-    let ecfg = handle.effective_config();
-    let compaction_on = ecfg.compaction.enabled && state.cfg.has_role(walgit_config::Role::Compact);
-    if !manifest.packs.is_empty() && !has_bitmap_base {
-        suggestions.push(Suggestion {
-            op: "compact",
-            params: Some("base=1".into()),
-            reason: "no bitmap'd base pack: clones compute reachability on every instance".into(),
-            auto: None,
-        });
-    } else if fresh >= ecfg.compaction.trigger_packs.max(2) {
+    let ecfg = handle.validated_effective_config().map_err(wal_err)?;
+    let maintenance_on = ecfg.packs.enabled && state.cfg.has_role(walgit_config::Role::Compact);
+    if fresh >= ecfg.packs.fold_needs_at_least_packs {
         suggestions.push(Suggestion {
             op: "compact",
             params: None,
-            reason: format!("{fresh} fresh push packs waiting to be folded"),
-            auto: compaction_on.then(|| {
-                format!(
-                    "geometric fold on the maintainer's next pass (trigger: {} packs / {})",
-                    ecfg.compaction.trigger_packs, ecfg.compaction.trigger_bytes
-                )
+            reason: format!("{fresh} fresh packs available for maintenance"),
+            auto: maintenance_on.then(|| {
+                "the maintainer evaluates size and age within each compatible pack family".into()
             }),
         });
     }

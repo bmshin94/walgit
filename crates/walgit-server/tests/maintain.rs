@@ -6,6 +6,101 @@ mod harness;
 use harness::{Server, git, git_in};
 use std::collections::HashMap;
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn classification_preserves_push_bytes_and_shared_group_cuts_settle() -> anyhow::Result<()> {
+    use walgit_server::ops::{CompactRequest, compact_repo};
+    let server = Server::start_with_tweak(|c| {
+        c.cache.mode = walgit_config::CacheMode::Disk;
+        c.packs.frozen_coverage_target = 0.0;
+    })
+    .await?;
+    server.put_repo("o", "shared").await?;
+    let src = tempfile::tempdir()?;
+    git_in(src.path(), &["init", "-q", "-b", "main"])?;
+    git_in(
+        src.path(),
+        &["config", "user.email", "test@example.invalid"],
+    )?;
+    git_in(src.path(), &["config", "user.name", "Test"])?;
+    std::fs::write(src.path().join("shared.txt"), "shared bytes\n")?;
+    git_in(src.path(), &["add", "."])?;
+    git_in(src.path(), &["commit", "-q", "-m", "code"])?;
+    git(
+        &["push", "-q", &server.repo_url("o", "shared"), "main"],
+        src.path(),
+    )?;
+    let handle = server
+        .state
+        .registry
+        .open(&walgit_git::RepoId::new("o", "shared")?)
+        .await?;
+    let before = handle.manifest().packs.clone();
+    compact_repo(&handle, CompactRequest::default(), &|_| {}).await?;
+    let after = handle.manifest();
+    assert_eq!(before.len(), after.packs.len());
+    for (old, new) in before.iter().zip(&after.packs) {
+        assert_eq!(
+            (&old.checksum, old.pack_size, old.tier),
+            (&new.checksum, new.pack_size, new.tier)
+        );
+        assert_eq!(new.pack_groups, ["code"]);
+    }
+    // A distinct metadata commit shares the complete tree/blob with code.
+    git_in(src.path(), &["checkout", "-q", "--orphan", "meta"])?;
+    git_in(src.path(), &["commit", "-q", "-m", "metadata"])?;
+    let meta = git_in(src.path(), &["rev-parse", "HEAD"])?;
+    git(
+        &[
+            "push",
+            "-q",
+            &server.repo_url("o", "shared"),
+            "HEAD:refs/meta/state",
+        ],
+        src.path(),
+    )?;
+    compact_repo(
+        &handle,
+        CompactRequest {
+            force: true,
+            rebuild_base: true,
+        },
+        &|_| {},
+    )
+    .await?;
+    // Repair certificates after the conserving cut; it must not recut shared bytes.
+    compact_repo(&handle, CompactRequest::default(), &|_| {}).await?;
+    let stable = handle.manifest();
+    assert!(
+        stable
+            .packs
+            .iter()
+            .any(|p| p.pack_groups.contains(&"code".into())
+                && p.pack_groups.contains(&"meta".into()))
+    );
+    for _ in 0..3 {
+        compact_repo(&handle, CompactRequest::default(), &|_| {}).await?;
+        assert_eq!(handle.manifest().packs, stable.packs);
+    }
+    let cold = server.start_sibling_with(|_| {}).await?;
+    let clone = tempfile::tempdir()?;
+    git(
+        &[
+            "clone",
+            "-q",
+            "--mirror",
+            &cold.repo_url("o", "shared"),
+            clone.path().to_str().unwrap(),
+        ],
+        src.path(),
+    )?;
+    assert_eq!(
+        git_in(clone.path(), &["rev-parse", "refs/meta/state"])?.trim(),
+        meta.trim()
+    );
+    git_in(clone.path(), &["fsck", "--strict"])?;
+    Ok(())
+}
+
 /// Every await is bounded so a hang names the step instead of stalling CI.
 macro_rules! step {
     ($name:literal, $e:expr) => {
@@ -58,7 +153,7 @@ async fn pass_checkpoints_due_repos_refs_level_and_reports_tasks() -> anyhow::Re
             c.cache.max_bytes = walgit_config::ByteSize::b(1);
             c.wal.snapshot_every_entries = 0;
             c.wal.checkpoint_interval = std::time::Duration::from_millis(1);
-            c.compaction.enabled = false;
+            c.packs.enabled = false;
         })
     )?;
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -104,7 +199,7 @@ async fn pass_checkpoints_due_repos_refs_level_and_reports_tasks() -> anyhow::Re
         front.start_sibling_with(|c| {
             c.server.roles = vec![walgit_config::Role::Maintain];
             c.wal.snapshot_every_entries = 0;
-            c.compaction.enabled = false;
+            c.packs.enabled = false;
         })
     )?;
     let id = walgit_git::RepoId::new("o", "r")?;
@@ -236,7 +331,7 @@ async fn fsck_unit_records_missing_objects_and_repair_unit_fetches_them_from_ups
         Server::start_with_tweak(|c| {
             c.git.allow_any_sha1_in_want = true;
             c.maintenance.checkpoints = false;
-            c.compaction.enabled = false;
+            c.packs.enabled = false;
             c.maintenance.fsck_interval = std::time::Duration::from_hours(1);
         })
     )?;
@@ -646,7 +741,7 @@ async fn manual_base_rebuild_on_an_ssd_maintainer() -> anyhow::Result<()> {
             ];
             c.maintenance.disk = walgit_config::MaintainerDisk::Ssd;
             c.cache.mode = walgit_config::CacheMode::Disk;
-            c.compaction.enabled = true;
+            c.packs.enabled = true;
             c.maintenance.checkpoints = false;
             c.maintenance.fsck_interval = std::time::Duration::ZERO;
         })
@@ -723,7 +818,6 @@ async fn manual_base_rebuild_on_an_ssd_maintainer() -> anyhow::Result<()> {
         "manual rebuild",
         walgit_server::ops::compact_repo(
             &h,
-            &h.effective_config(),
             walgit_server::ops::CompactRequest {
                 force: true,
                 rebuild_base: true
@@ -837,7 +931,7 @@ async fn maintainer_builds_and_publishes_missing_rev_indexes() -> anyhow::Result
         "start",
         Server::start_with_tweak(|c| {
             c.maintenance.checkpoints = false;
-            c.compaction.enabled = false;
+            c.packs.enabled = false;
             c.maintenance.fsck_interval = std::time::Duration::ZERO;
         })
     )?;
@@ -978,6 +1072,43 @@ async fn maintainer_builds_and_publishes_missing_rev_indexes() -> anyhow::Result
                 .pack_path(&gix_hash::ObjectId::from_hex(sha.as_bytes())?)
                 .with_extension("rev")
         )?
+    );
+    Ok(())
+}
+
+/// Manual force and full-cut requests obey committed repository disablement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_pack_work_cannot_override_saved_disablement() -> anyhow::Result<()> {
+    let server = Server::start_with_tweak(|cfg| cfg.packs.enabled = true).await?;
+    server.put_repo("o", "disabled").await?;
+    let id = walgit_git::RepoId::new("o", "disabled")?;
+    let handle = server.state.registry.open(&id).await?;
+    handle
+        .publish_settings("[packs]\nenabled = false\n", "admin", "pause maintenance")
+        .await?;
+    let before = handle.manifest();
+    for rebuild_base in [false, true] {
+        let error = walgit_server::ops::compact_repo(
+            &handle,
+            walgit_server::ops::CompactRequest {
+                force: true,
+                rebuild_base,
+            },
+            &walgit_server::ops::noop_log,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("disabled by the effective repository settings"),
+            "{error:#}"
+        );
+    }
+    assert_eq!(
+        handle.manifest(),
+        before,
+        "disabled requests changed committed state"
     );
     Ok(())
 }

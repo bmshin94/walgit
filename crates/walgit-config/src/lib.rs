@@ -2,6 +2,8 @@
 //! `WALGIT__SECTION__KEY=value` (double underscore = nesting), applied after
 //! the file is parsed. `PORT` (a serverless host) overrides `server.listen` port.
 
+pub mod packs;
+pub use packs::{DeltaBudget, FoldInventory, FoldReason, FreezeReason, PacksConfig};
 pub mod refs;
 pub use refs::{PackGroupConfig, PackGroupKind, RefsConfig};
 
@@ -20,7 +22,7 @@ pub struct Config {
     pub store: StoreConfig,
     pub cache: CacheConfig,
     pub wal: WalConfig,
-    pub compaction: CompactionConfig,
+    pub packs: PacksConfig,
     pub refs: RefsConfig,
     pub packfile_uri: PackfileUriConfig,
     pub maintenance: MaintenanceConfig,
@@ -510,32 +512,6 @@ impl PlacementConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct CompactionConfig {
-    pub enabled: bool,
-    /// Geometric factor between tiers.
-    pub factor: u32,
-    /// Compact when this many fresh (tier 0) packs exist.
-    pub trigger_packs: usize,
-    /// Or when fresh pack bytes exceed this.
-    pub trigger_bytes: ByteSize,
-    #[serde(with = "humantime_serde")]
-    pub lease_ttl: Duration,
-    /// Keep superseded packs and old index generations for this long (provenance/rewind).
-    #[serde(with = "humantime_serde")]
-    pub retention_superseded: Duration,
-    /// Use upstream git for delta compression (`git repack`); gix does not delta-compress.
-    pub engine: RepackEngine,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum RepackEngine {
-    #[default]
-    Git,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum LfsServe {
@@ -706,13 +682,8 @@ fn default_true() -> bool {
 }
 
 /// D24: the top-level sections a repository's settings may override.
-pub const SETTINGS_SECTIONS: &[&str] = &[
-    "maintenance",
-    "compaction",
-    "upstream",
-    "refs",
-    "packfile_uri",
-];
+pub const SETTINGS_SECTIONS: &[&str] =
+    &["maintenance", "packs", "upstream", "refs", "packfile_uri"];
 /// D24: maximum size of a settings document.
 pub const SETTINGS_MAX_BYTES: usize = 16 * 1024;
 
@@ -940,19 +911,6 @@ impl Default for WalConfig {
         }
     }
 }
-impl Default for CompactionConfig {
-    fn default() -> Self {
-        CompactionConfig {
-            enabled: true,
-            factor: 2,
-            trigger_packs: 16,
-            trigger_bytes: ByteSize::gib(1),
-            lease_ttl: Duration::from_mins(10),
-            retention_superseded: Duration::from_hours(168),
-            engine: RepackEngine::Git,
-        }
-    }
-}
 impl Default for LfsConfig {
     fn default() -> Self {
         LfsConfig {
@@ -1120,6 +1078,7 @@ impl Config {
 
     pub fn validate(&self) -> Result<()> {
         self.refs.validate()?;
+        self.packs.validate()?;
         anyhow::ensure!(
             self.packfile_uri.uri_min_bytes.as_u64() > 0,
             "packfile_uri.uri_min_bytes must be positive"
@@ -1276,10 +1235,6 @@ impl Config {
                 "server.auth.session_secret is required with oauth_client_id (it signs sessions and access tokens)"
             );
         }
-        anyhow::ensure!(
-            self.compaction.factor >= 2,
-            "compaction.factor must be >= 2"
-        );
         anyhow::ensure!(self.wal.max_batch >= 1, "wal.max_batch must be >= 1");
         if let Some(u) = &self.events.webhook_url {
             anyhow::ensure!(
@@ -1575,23 +1530,43 @@ mod tests {
     }
 
     #[test]
+    fn removed_compaction_configuration_is_rejected() {
+        for input in [
+            "[compaction]\nenabled = true\n",
+            "[packs]\nfactor = 2\n",
+            "[packs]\ntrigger_bytes = \"1GiB\"\n",
+            "[packs]\nretention_superseded = \"7d\"\n",
+            "[packs]\nengine = \"git\"\n",
+        ] {
+            assert!(Config::parse(input).is_err(), "{input}");
+            assert!(Config::default().with_settings(input).is_err(), "{input}");
+        }
+        assert!(
+            !Config::default()
+                .public_settings_toml()
+                .unwrap()
+                .contains("[compaction]")
+        );
+    }
+
+    #[test]
     fn settings_merge_over_config_and_are_restricted() {
         let mut base = Config::default();
         base.store.bucket = "b".into();
         let eff = base
             .with_settings(
                 r"
-[compaction]
-factor = 3
+[packs]
+geometric_factor = 3
 [maintenance]
 checkpoints = false
 ",
             )
             .unwrap();
-        assert_eq!(eff.compaction.factor, 3);
+        assert_eq!(eff.packs.geometric_factor, 3);
         assert!(!eff.maintenance.checkpoints);
         assert_eq!(
-            eff.compaction.trigger_packs, base.compaction.trigger_packs,
+            eff.packs.fold_when_fresh_packs_reach, base.packs.fold_when_fresh_packs_reach,
             "untouched keys keep the host's values"
         );
         // Forbidden section.
@@ -1606,16 +1581,16 @@ listen = \"0.0.0.0:1\"\n",
         // A section the docs once promised but the code never accepted.
         assert!(base.with_settings("[integrations]\nx = 1\n").is_err());
         // Unknown key inside an allowed section.
-        assert!(base.with_settings("[compaction]\nnope = 1\n").is_err());
+        assert!(base.with_settings("[packs]\nnope = 1\n").is_err());
         // Invalid effective config (geometric factor below two).
         let e = base
-            .with_settings("[compaction]\nfactor = 1\n")
+            .with_settings("[packs]\ngeometric_factor = 1\n")
             .unwrap_err()
             .to_string();
         assert!(e.contains("settings"), "{e}");
         assert_eq!(
-            base.with_settings("  ").unwrap().compaction.factor,
-            base.compaction.factor
+            base.with_settings("  ").unwrap().packs.geometric_factor,
+            base.packs.geometric_factor
         );
         let e = base
             .with_settings("[upstream]\ntoken_env = \"AWS_SECRET_ACCESS_KEY\"\n")
@@ -1623,7 +1598,7 @@ listen = \"0.0.0.0:1\"\n",
             .to_string();
         assert!(e.contains("token_env"), "{e}");
         let pub_toml = base.public_settings_toml().unwrap();
-        assert!(pub_toml.contains("[compaction]"), "{pub_toml}");
+        assert!(pub_toml.contains("[packs]"), "{pub_toml}");
         assert!(!pub_toml.contains("session_secret"), "{pub_toml}");
         assert!(!pub_toml.contains("[server]"), "{pub_toml}");
         assert!(!pub_toml.contains("token_env"), "{pub_toml}");

@@ -506,6 +506,8 @@ pub(crate) async fn reconcile_packs_inner(
 ) -> Result<(), WalError> {
     let store = &handle.store;
     let local = &handle.local;
+    let segmented = manifest.packs.iter().any(|p| !p.pack_groups.is_empty());
+    local.set_segmented_midx_mode(segmented);
     // Test hook: simulate an unknown blocking call inside the install path
     // (what prod had: 2.6–43 s runtime stalls during materialization). With
     // the bulk runtime this only delays bulk work.
@@ -587,7 +589,11 @@ pub(crate) async fn reconcile_packs_inner(
     // be served from the linked/remote base right away. They are installed by
     // a background task (`RepoHandle::spawn_history_pack_install`) so the
     // first request on an instance never waits for a 7.5 GB download.
-    let is_history = |p: &PackRef| p.kind == walgit_proto::v1::PackKind::History as i32;
+    let is_history = |p: &PackRef| {
+        p.kind == walgit_proto::v1::PackKind::History as i32
+            && p.pack_groups.is_empty()
+            && !p.derived_from.is_empty()
+    };
     let deferred_history: Vec<PackRef> = manifest
         .packs
         .iter()
@@ -774,6 +780,44 @@ pub(crate) async fn reconcile_packs_inner(
         handle.state.lock().pending_pack_removals = still_pending;
     }
 
+    if segmented {
+        if remote_served.is_empty() {
+            let ids = manifest
+                .packs
+                .iter()
+                .map(|p| {
+                    gix_hash::ObjectId::from_hex(p.checksum.as_bytes())
+                        .map_err(|e| WalError::Corrupt(format!("pack checksum: {e}")))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let pin = handle.pin_local_objects().await;
+            let repo = local.clone();
+            let (refs, pin) = tokio::task::spawn_blocking(move || {
+                let refs = repo.refs();
+                (refs, pin)
+            })
+            .await
+            .map_err(|e| WalError::Corrupt(format!("MIDX refs: {e}")))?;
+            let refs = refs?;
+            if let Some(commit) = refs.refs.iter().find(|r| r.name.starts_with("refs/heads/")) {
+                let oid = gix_hash::ObjectId::from_hex(commit.oid.as_bytes())
+                    .map_err(|e| WalError::Corrupt(format!("MIDX root: {e}")))?;
+                // Bitmap verification is strict; a concurrent ref move can
+                // legitimately outpace the captured pack inventory. Failure
+                // leaves ordinary non-bitmap object traversal available.
+                if let Err(error) = local.write_verified_midx(&ids, oid, pin).await {
+                    tracing::warn!(repo = %handle.id, %error, "segmented MIDX unavailable; ordinary traversal remains active");
+                }
+            }
+        } else {
+            // A MIDX bitmap over absent pack bytes is not native-readable.
+            // Invalidation never queues a writer behind long-lived readers.
+            if let Ok(_guard) = handle.rw.try_write() {
+                local.invalidate_midx()?;
+            }
+        }
+    }
+
     {
         let mut state = handle.state.lock();
         state.packs_revision = manifest.revision;
@@ -818,7 +862,11 @@ pub(crate) async fn maintain_commit_graph(
     // After a base change every non-base pack must be re-added (the old chain
     // layers were dropped); otherwise only what was just installed.
     // History packs hold the base's commits, already covered by its layer.
-    let is_history = |p: &&PackRef| p.kind == walgit_proto::v1::PackKind::History as i32;
+    let is_history = |p: &&PackRef| {
+        p.kind == walgit_proto::v1::PackKind::History as i32
+            && p.pack_groups.is_empty()
+            && !p.derived_from.is_empty()
+    };
     let candidates: Vec<&PackRef> = if base_changed {
         manifest
             .packs

@@ -769,7 +769,7 @@ export interface SettingsDescribe {
     interval_secs: number;
     this_host: { name: string; serves: boolean; maintains: boolean; disk: string; max_pack_bytes: number; cache_budget_bytes: number; roles: string[] };
   };
-  compaction: { enabled: boolean; trigger_packs: number; trigger_bytes: number };
+  packs: { enabled: boolean; fold_when_fresh_packs_reach: number; fold_when_max_age_secs: number; segment_max_bytes: number; freeze_when_settled_secs: number };
   /** D33: what this repository follows (`[upstream] follow`) and the last round on the answering instance. */
   upstream: {
     git: string | null;

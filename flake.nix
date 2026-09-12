@@ -98,11 +98,11 @@
             mkdir -p web
             cp -a ${web} web/dist
           '';
-          # `walgit serve` shells out to git (upload-pack, repack, index-pack).
+          # `walgit serve` shells out to git and GNU sort/comm for bounded pack planning.
           nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ pkgs.makeWrapper ];
           postInstall = ''
             for b in walgit walgit-server; do
-              wrapProgram "$out/bin/$b" --prefix PATH : ${lib.makeBinPath [ pkgs.git pkgs.git-lfs ]}
+              wrapProgram "$out/bin/$b" --prefix PATH : ${lib.makeBinPath [ pkgs.git pkgs.git-lfs pkgs.coreutils ]}
             done
           '';
           meta = {
@@ -156,6 +156,7 @@
             just
             git
             git-lfs
+            coreutils
             jq
             ripgrep
             fd

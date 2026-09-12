@@ -297,7 +297,7 @@ fn describe_json(
             "interval_secs": effective.maintenance.interval.as_secs(),
             "this_host": {"name": crate::maintain::host_name(st), "maintains": st.cfg.placement.maintains(h.id().owner(), h.id().name()), "serves": st.cfg.placement.serves(h.id().owner(), h.id().name()), "disk": format!("{:?}", st.cfg.maintenance.disk).to_lowercase(), "max_pack_bytes": st.cfg.maintenance.max_pack_bytes.as_u64(), "cache_budget_bytes": st.cfg.cache_budget_bytes(), "roles": st.cfg.server.roles.iter().map(|r| format!("{r:?}").to_lowercase()).collect::<Vec<_>>()},
         },
-        "compaction": {"enabled": effective.compaction.enabled, "trigger_packs": effective.compaction.trigger_packs, "trigger_bytes": effective.compaction.trigger_bytes.as_u64()},
+        "packs": {"enabled": effective.packs.enabled, "fold_when_fresh_packs_reach": effective.packs.fold_when_fresh_packs_reach, "fold_when_max_age_secs": effective.packs.fold_when_max_age.as_secs(), "segment_max_bytes": effective.packs.segment_max_bytes.as_u64(), "freeze_when_settled_secs": effective.packs.freeze_when_settled.as_secs()},
         // D33: what this repository follows and what the last round on this instance did.
         "upstream": {
             "git": effective.upstream.git,

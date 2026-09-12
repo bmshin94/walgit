@@ -4,7 +4,10 @@
 //! D2 and docs/CONTRACT.md walgit-git.
 
 pub mod follow;
+pub mod maintenance_input;
+pub mod midx;
 pub mod pack_groups;
+pub mod pack_segments;
 pub mod pkt;
 pub mod receive;
 pub mod repair;
@@ -558,6 +561,8 @@ struct Inner {
     refs_gen: std::sync::atomic::AtomicU64,
     /// How often `packed-refs` + loose refs were parsed (tests assert pushes do not add to it).
     refs_parses: std::sync::atomic::AtomicU64,
+    /// Disposable serving mode selected from the committed manifest by sync.
+    segmented_midx: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Clone)]
@@ -648,6 +653,7 @@ impl LocalRepo {
                 refs_cache: parking_lot::Mutex::new(None),
                 refs_gen: std::sync::atomic::AtomicU64::new(0),
                 refs_parses: std::sync::atomic::AtomicU64::new(0),
+                segmented_midx: std::sync::atomic::AtomicBool::new(false),
             }),
         })
     }
@@ -673,6 +679,7 @@ impl LocalRepo {
                 refs_cache: parking_lot::Mutex::new(None),
                 refs_gen: std::sync::atomic::AtomicU64::new(0),
                 refs_parses: std::sync::atomic::AtomicU64::new(0),
+                segmented_midx: std::sync::atomic::AtomicBool::new(false),
             }),
         }))
     }
@@ -964,6 +971,13 @@ impl LocalRepo {
         let hex = checksum.to_hex();
         let pack_dir = self.objects_pack_dir();
         let was_history = pack_dir.join(format!("pack-{hex}.history")).exists();
+        if self
+            .inner
+            .segmented_midx
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.invalidate_midx()?;
+        }
         for ext in ["pack", "idx", "rev", "bitmap", "commit-graph", "history"] {
             let p = pack_dir.join(format!("pack-{hex}.{ext}"));
             match std::fs::remove_file(&p) {
@@ -2238,6 +2252,13 @@ impl LocalRepo {
     }
 
     fn write_history_midx_blocking(&self) -> Result<(), GitError> {
+        if self
+            .inner
+            .segmented_midx
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(());
+        }
         // The midx covers the history pack(s) **and their bases** (when the
         // base idx is installed: linked or local), history first as the
         // preferred pack: an object in both resolves to the history pack, and

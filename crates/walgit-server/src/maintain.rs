@@ -29,8 +29,7 @@ pub async fn run_loop(state: Arc<AppState>) {
         // `maintain.pass`: one close line per pass with the counts; every unit
         // (and its task.run) is a child, so a trace holds the whole pass.
         let span = tracing::info_span!("maintain.pass", host = %host, pass = passes, repos = tracing::field::Empty, units = tracing::field::Empty, skipped = tracing::field::Empty, outcome = tracing::field::Empty);
-        // Heartbeat DURING the pass too: a long unit (Sunday's 25-min base
-        // rebuild, a 1 h rev-index over a 32 GB pack) otherwise shows the host
+        // Heartbeat during long pack and reverse-index work; otherwise it shows the host
         // STALE and `upcoming` as "no live maintainer" while it is working.
         let ticker = {
             let (state, host, last_unit) = (state.clone(), host.clone(), last_unit.clone());
@@ -134,7 +133,7 @@ pub async fn next_unit(state: &Arc<AppState>, id: &RepoId) -> anyhow::Result<Uni
     handle.sync_refs().await?;
     // D24: the repository's effective config (host ⊕ settings) decides what is
     // due; host-level facts (roles, assignment, capacity) stay the host's.
-    let cfg = handle.effective_config();
+    let cfg = handle.validated_effective_config()?;
     {
         // Checkpoint lag/age gauges: how far the fold is behind the head.
         let m = handle.manifest();
@@ -174,10 +173,11 @@ pub async fn next_unit(state: &Arc<AppState>, id: &RepoId) -> anyhow::Result<Uni
             return Ok(Unit::Repair(f.missing_total));
         }
     }
-    if cfg.compaction.enabled
+    if cfg.packs.enabled
         && state.cfg.has_role(walgit_config::Role::Compact)
         && handle.packs_fit()
-        && crate::ops::compaction_triggered(&handle, &cfg)
+        && crate::pack_lifecycle::plan(&handle.manifest(), &cfg, std::time::SystemTime::now())
+            .is_some()
     {
         return Ok(Unit::Compact);
     }
